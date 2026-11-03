@@ -1,0 +1,35 @@
+
+import cv2
+from pathlib import Path
+
+# Use the same AprilTag family as your height tracker
+dictionary = cv2.aruco.getPredefinedDictionary(
+    cv2.aruco.DICT_APRILTAG_36h11
+)
+
+# Generate AprilTag ID 0
+tag = cv2.aruco.generateImageMarker(
+    dictionary, 0, 600
+)
+
+# Add a white border
+tag = cv2.copyMakeBorder(
+    tag, 100, 100, 100, 100,
+    cv2.BORDER_CONSTANT,
+    value=255
+)
+
+# Save next to this Python file
+output = Path(__file__).parent / "apriltag_36h11_id0.png"
+cv2.imwrite(str(output), tag)
+
+# Verify that OpenCV can detect the generated tag
+detector = cv2.aruco.ArucoDetector(
+    dictionary,
+    cv2.aruco.DetectorParameters()
+)
+
+corners, ids, rejected = detector.detectMarkers(tag)
+
+print("Saved AprilTag to:", output)
+print("Detected IDs:", ids)
