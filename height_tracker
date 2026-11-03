@@ -1,0 +1,593 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+from collections import deque
+from pathlib import Path
+from datetime import datetime
+
+# ============================================
+# PREV-HUB AUTOMATIC HEIGHT TRACKER
+# Python 3.11.9 - Webcam Prototype
+# ============================================
+
+CAMERA_INDEX = 0
+
+# Camera is mounted vertically (90 degrees).
+# Options: None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE
+# If you appear upside down, switch to the other direction.
+ROTATE = cv2.ROTATE_90_CLOCKWISE
+
+# --------------------------------------------
+# BOOTH GEOMETRY  (measure these with a tape measure)
+# --------------------------------------------
+# All distances are HORIZONTAL, along the floor, from the camera lens.
+#
+#   NOW (MacBook test):  camera 42 in high, level, patient 5.4 ft away,
+#                        tag 3.5 ft behind patient (9.1 ft from camera)
+#   LATER (booth):       camera 78 in (6.5 ft) high, tilted 27.5 deg down,
+#                        patient 3.5 ft away, tag 3.5 ft behind (7 ft)
+
+CAMERA_HEIGHT_IN = 42.0          # floor -> camera lens          (later: 78.0)
+CAMERA_TILT_DEG = 0.0            # downward tilt, 0 = level      (later: 27.5)
+PATIENT_DISTANCE_FT = 5.4        # camera -> where patient stands (later: 3.5)
+TAG_DISTANCE_FT = 9.1            # camera -> wall with the tag    (later: 7.0)
+TAG_CENTER_HEIGHT_IN = 56.0      # floor -> CENTER of the tag (measure it!)
+
+# AprilTag settings
+TAG_SIZE_CM = 6.5                # outer BLACK square, measured with a ruler
+TAG_ID = 0
+
+# Fine-tune after testing with people of known height
+CALIBRATION_FACTOR = 1.0         # multiply (true / shown, if off by a %)
+HEIGHT_OFFSET_CM = 0.0           # add/subtract (if always off by same cm)
+
+# Automatic screenshot settings
+STABLE_FRAMES = 18
+RESET_FRAMES = 20
+
+# Where screenshots will be saved
+SAVE_FOLDER = Path.home() / "Downloads" / "PrevHub_Captures"
+SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
+
+WINDOW_NAME = "PREV-HUB Automatic Height Tracker"
+
+# ============================================
+# INITIALIZE MEDIAPIPE
+# ============================================
+
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+    enable_segmentation=True,      # person outline, used to find the real top of head
+    smooth_segmentation=True
+)
+
+# Segmentation mask threshold (0-1). Higher = tighter outline.
+MASK_THRESHOLD = 0.5
+
+
+def find_head_top(mask, x_center, half_width, start_y):
+    """Scan UP from start_y (nose) inside a narrow column until the
+    person outline ends. Returns the y of the top of the head/hair,
+    or None if the mask is unavailable."""
+    if mask is None or start_y <= 0:
+        return None
+    mh, mw = mask.shape[:2]
+    x0 = max(0, x_center - half_width)
+    x1 = min(mw, x_center + half_width)
+    if x1 <= x0:
+        return None
+    counts = (mask[:start_y, x0:x1] > MASK_THRESHOLD).sum(axis=1)
+    min_px = max(3, int((x1 - x0) * 0.15))
+    gaps = np.where(counts < min_px)[0]
+    return int(gaps[-1] + 1) if len(gaps) else 0
+
+
+def find_feet_bottom(mask, x0, x1, start_y):
+    """Scan DOWN from start_y (ankles) until the person outline ends.
+    Returns the y where the feet touch the floor, or None."""
+    if mask is None:
+        return None
+    mh, mw = mask.shape[:2]
+    x0 = max(0, x0)
+    x1 = min(mw, x1)
+    if x1 <= x0 or start_y >= mh:
+        return None
+    counts = (mask[start_y:, x0:x1] > MASK_THRESHOLD).sum(axis=1)
+    min_px = max(3, int((x1 - x0) * 0.05))
+    gaps = np.where(counts < min_px)[0]
+    return int(start_y + gaps[0] - 1) if len(gaps) else mh - 1
+
+# ============================================
+# INITIALIZE APRILTAG DETECTOR
+# ============================================
+
+aruco = getattr(cv2, "aruco", None)
+
+if aruco is not None:
+    dictionary = aruco.getPredefinedDictionary(
+        aruco.DICT_APRILTAG_36h11
+    )
+
+    parameters = aruco.DetectorParameters()
+    detector = aruco.ArucoDetector(
+        dictionary, parameters
+    )
+
+    print("AprilTag detection enabled.")
+else:
+    detector = None
+    print("AprilTag unavailable. Pixel tracking only.")
+
+# ============================================
+# OPEN CAMERA
+# ============================================
+
+cap = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_AVFOUNDATION
+)
+
+if not cap.isOpened():
+    print("ERROR: Camera could not be opened.")
+    pose.close()
+    raise SystemExit
+
+print("PREV-HUB HEIGHT TRACKER STARTED")
+print("Stand with your full body visible.")
+print("Press S to save a screenshot manually.")
+print("Press Q to quit.")
+
+# Resizable window (rotated image is tall)
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+# ============================================
+# TRACKING VARIABLES
+# ============================================
+
+pixel_history = deque(maxlen=STABLE_FRAMES)
+focal_history = deque(maxlen=60)
+head_history = deque(maxlen=STABLE_FRAMES)
+
+cam_h_cm = CAMERA_HEIGHT_IN * 2.54
+tilt_rad = np.radians(CAMERA_TILT_DEG)
+patient_dist_cm = PATIENT_DISTANCE_FT * 30.48
+tag_dist_cm = TAG_DISTANCE_FT * 30.48
+
+stable_count = 0
+missing_count = 0
+screenshot_taken = False
+
+# ============================================
+# MAIN CAMERA LOOP
+# ============================================
+
+try:
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            print("Could not read camera frame.")
+            break
+
+        # Rotate vertically mounted camera upright
+        if ROTATE is not None:
+            frame = cv2.rotate(frame, ROTATE)
+
+        h, w = frame.shape[:2]
+
+        # ------------------------------------
+        # DETECT APRILTAG
+        # Must run on the UNMIRRORED frame: a mirrored
+        # AprilTag decodes as an invalid code, so
+        # detectMarkers() always returns None.
+        # ------------------------------------
+
+        tag_found = False
+        tag_pts = None
+
+        if detector is not None:
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            corners, ids, rejected = detector.detectMarkers(gray)
+
+            if ids is not None:
+
+                for i, marker_id in enumerate(ids.flatten()):
+
+                    if marker_id != TAG_ID:
+                        continue
+
+                    pts = corners[i].reshape(4, 2).copy()
+
+                    # Use the two most HORIZONTAL edges: a downward tilt
+                    # shrinks the vertical edges but not the horizontal ones
+                    edges = [pts[(j + 1) % 4] - pts[j] for j in range(4)]
+                    horiz = [
+                        np.linalg.norm(e) for e in edges
+                        if abs(e[0]) >= abs(e[1])
+                    ]
+                    if len(horiz) == 0:
+                        horiz = [np.linalg.norm(e) for e in edges]
+                    tag_width_px = float(np.mean(horiz))
+
+                    if tag_width_px > 5:
+
+                        # Depth of the tag along the camera's view direction
+                        tag_drop_cm = cam_h_cm - TAG_CENTER_HEIGHT_IN * 2.54
+                        tag_z_cm = (
+                            tag_dist_cm * np.cos(tilt_rad)
+                            + tag_drop_cm * np.sin(tilt_rad)
+                        )
+
+                        # Focal length in pixels: tag width = f * size / depth
+                        focal_history.append(
+                            tag_width_px * tag_z_cm / TAG_SIZE_CM
+                        )
+
+                        tag_found = True
+                        tag_center_y = float(pts[:, 1].mean())
+
+                        # Convert corners to mirrored-frame
+                        # coordinates for drawing
+                        pts[:, 0] = (w - 1) - pts[:, 0]
+                        tag_pts = pts
+
+                        break
+
+        # Camera focal length (pixels), learned from the tag.
+        # Kept after the tag is hidden, since the camera doesn't move.
+        focal_px = float(np.median(focal_history)) if focal_history else None
+
+        # Mirror webcam AFTER tag detection
+        # (display, MediaPipe and screenshots stay mirrored)
+        frame = cv2.flip(frame, 1)
+
+        if tag_pts is not None:
+
+            cv2.polylines(
+                frame,
+                [tag_pts.astype(np.int32)],
+                True,
+                (255, 0, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"AprilTag {TAG_ID} Detected",
+                (
+                    int(tag_pts[:, 0].min()),
+                    max(20, int(tag_pts[:, 1].min()) - 10)
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 0, 255),
+                2
+            )
+
+        # ------------------------------------
+        # DETECT BODY
+        # ------------------------------------
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        results = pose.process(rgb)
+
+        full_body = False
+        pixel_height = None
+
+        if results.pose_landmarks:
+
+            landmarks = results.pose_landmarks.landmark
+
+            mp_drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS
+            )
+
+            nose = landmarks[mp_pose.PoseLandmark.NOSE]
+            left_heel = landmarks[mp_pose.PoseLandmark.LEFT_HEEL]
+            right_heel = landmarks[mp_pose.PoseLandmark.RIGHT_HEEL]
+            left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
+            right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+            left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+            right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+            left_ear = landmarks[mp_pose.PoseLandmark.LEFT_EAR]
+            right_ear = landmarks[mp_pose.PoseLandmark.RIGHT_EAR]
+            left_toe = landmarks[mp_pose.PoseLandmark.LEFT_FOOT_INDEX]
+            right_toe = landmarks[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX]
+
+            required = [
+                nose,
+                left_heel,
+                right_heel,
+                left_ankle,
+                right_ankle,
+                left_shoulder,
+                right_shoulder
+            ]
+
+            visible = all(p.visibility > 0.5 for p in required)
+
+            if visible:
+
+                nose_y = int(nose.y * h)
+
+                ankle_y = int(max(left_ankle.y, right_ankle.y) * h)
+
+                # Landmark-only feet estimate (fallback)
+                landmark_feet_y = int(
+                    max(
+                        left_heel.y,
+                        right_heel.y,
+                        left_toe.y,
+                        right_toe.y
+                    ) * h
+                )
+
+                # Head center = midpoint between the ears
+                center_x = int((left_ear.x + right_ear.x) / 2 * w)
+                ear_span = int(abs(left_ear.x - right_ear.x) * w)
+
+                mask = results.segmentation_mask
+
+                # ---- TOP OF HEAD from the person outline ----
+                head_top_y = find_head_top(
+                    mask,
+                    center_x,
+                    max(8, ear_span // 4),
+                    nose_y
+                )
+
+                if head_top_y is None:
+                    # Fallback: old estimate
+                    head_top_y = int(nose_y - (landmark_feet_y - nose_y) * 0.15)
+
+                # ---- FEET (floor contact) from the person outline ----
+                foot_xs = [
+                    p.x * w for p in
+                    (left_heel, right_heel, left_toe, right_toe,
+                     left_ankle, right_ankle)
+                ]
+                margin = max(10, ear_span // 2)
+
+                feet_y = find_feet_bottom(
+                    mask,
+                    int(min(foot_xs)) - margin,
+                    int(max(foot_xs)) + margin,
+                    ankle_y
+                )
+
+                if feet_y is None:
+                    feet_y = landmark_feet_y
+
+                # Check approximate full-body coverage
+                full_body = (
+                    10 < head_top_y < h - 30
+                    and 10 < feet_y < h - 10
+                    and 0 < center_x < w
+                    and feet_y > nose_y
+                )
+
+                if full_body:
+
+                    pixel_height = feet_y - head_top_y
+
+                    pixel_history.append(pixel_height)
+                    head_history.append(head_top_y)
+
+                    smooth_pixels = float(np.median(pixel_history))
+
+                    # Yellow measurement line
+                    cv2.line(
+                        frame,
+                        (center_x, head_top_y),
+                        (center_x, feet_y),
+                        (0, 255, 255),
+                        3
+                    )
+
+                    # Red dot at estimated head top
+                    cv2.circle(frame, (center_x, head_top_y), 6, (0, 0, 255), -1)
+
+                    # Red dot near feet
+                    cv2.circle(frame, (center_x, feet_y), 6, (0, 0, 255), -1)
+
+        # ------------------------------------
+        # DISPLAY MEASUREMENTS
+        # ------------------------------------
+
+        cv2.rectangle(
+            frame,
+            (5, 5),
+            (min(w - 5, 430), 160),
+            (25, 25, 25),
+            -1
+        )
+
+        if full_body:
+
+            missing_count = 0
+
+            cv2.putText(
+                frame,
+                f"Pixel Height: {smooth_pixels:.0f} px",
+                (15, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+            if focal_px is not None:
+
+                # Angle of the head-top pixel below the image center
+                head_y = float(np.median(head_history))
+                cy = h / 2.0
+                angle_down = tilt_rad + np.arctan((head_y - cy) / focal_px)
+
+                # Height of the line of sight at the patient's distance
+                height_cm = (
+                    cam_h_cm - patient_dist_cm * np.tan(angle_down)
+                ) * CALIBRATION_FACTOR + HEIGHT_OFFSET_CM
+
+                total_inches = height_cm / 2.54
+                feet = int(total_inches // 12)
+                inches = total_inches - feet * 12
+
+                cv2.putText(
+                    frame,
+                    f"Est. Height: {feet} ft {inches:.1f} in",
+                    (15, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Est. Height: {height_cm:.1f} cm",
+                    (15, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2
+                )
+
+                if tag_found:
+                    # Sanity check: tilt implied by where the tag appears
+                    tag_angle = np.arctan(
+                        (cam_h_cm - TAG_CENTER_HEIGHT_IN * 2.54) / tag_dist_cm
+                    )
+                    seen_tilt = np.degrees(
+                        tag_angle - np.arctan((tag_center_y - cy) / focal_px)
+                    )
+                    status = f"TAG OK  tilt check: {seen_tilt:.1f} deg"
+                else:
+                    status = "TAG HIDDEN - USING SAVED CALIBRATION"
+
+            else:
+                status = "SHOW APRILTAG TO CALIBRATE"
+
+            cv2.putText(
+                frame,
+                status,
+                (15, 125),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                2
+            )
+
+            # --------------------------------
+            # CHECK MEASUREMENT STABILITY
+            # --------------------------------
+
+            if len(pixel_history) == STABLE_FRAMES:
+
+                variation = np.std(pixel_history) / max(
+                    np.mean(pixel_history), 1
+                )
+
+                if variation < 0.02:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+
+            cv2.putText(
+                frame,
+                f"Hold still: {min(stable_count, STABLE_FRAMES)}/{STABLE_FRAMES}",
+                (15, 150),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1
+            )
+
+            # --------------------------------
+            # AUTOMATIC SCREENSHOT
+            # (only when a real height is shown)
+            # --------------------------------
+
+            if (
+                stable_count >= STABLE_FRAMES
+                and focal_px is not None
+                and not screenshot_taken
+            ):
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                filename = SAVE_FOLDER / f"height_capture_{timestamp}.png"
+
+                cv2.putText(
+                    frame,
+                    "MEASUREMENT CAPTURED",
+                    (15, min(h - 25, 190)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0),
+                    2
+                )
+
+                saved = cv2.imwrite(str(filename), frame)
+
+                if saved:
+                    print(f"Screenshot saved: {filename}")
+                else:
+                    print("Screenshot could not be saved.")
+
+                screenshot_taken = True
+
+        else:
+
+            missing_count += 1
+            stable_count = 0
+            pixel_history.clear()
+            head_history.clear()
+
+            cv2.putText(
+                frame,
+                "Stand with full body visible",
+                (15, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (0, 0, 255),
+                2
+            )
+
+            # Reset when patient leaves frame
+            if missing_count >= RESET_FRAMES:
+
+                screenshot_taken = False
+                missing_count = RESET_FRAMES
+
+        # ------------------------------------
+        # CAMERA WINDOW
+        # ------------------------------------
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+        elif key == ord("s"):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = SAVE_FOLDER / f"manual_capture_{timestamp}.png"
+            cv2.imwrite(str(filename), frame)
+            print(f"Manual screenshot saved: {filename}")
+
+finally:
+    cap.release()
+    pose.close()
+    cv2.destroyAllWindows()
