@@ -79,6 +79,25 @@ CAPTURES_PER_PATIENT = 3         # measurements taken per patient (final = media
 MAX_SPREAD_CM = 2.5              # warn if the measurements disagree more than this
 RESET_FRAMES = 20                # frames with nobody in view before the next patient
 
+# --------------------------------------------
+# STANDING LINE CHECK  (press L to teach the line)
+# --------------------------------------------
+# During setup, stand with the MIDDLE of your feet on the tape line and
+# press L. The program remembers that spot and asks patients to step
+# back/forward if they're off it. Not used in the height calculation.
+LINE_TOLERANCE_CM = 8.0          # how far off the line is still OK
+ANKLE_HEIGHT_CM = 8.0            # approx. height of the ankle bone above the floor
+# The check uses the ANKLES: a front-facing camera can't see the heels,
+# and the toes drop below the bottom of the picture first.
+
+# --------------------------------------------
+# CAMERA-MOVED DETECTION
+# --------------------------------------------
+# While the booth is empty, the tag is re-checked. If the camera has
+# moved, the program recalibrates by itself.
+MOVED_TILT_DEG = 0.3             # tilt change that counts as "moved"
+MOVED_FOCAL_PCT = 2.0            # zoom/distance change that counts as "moved"
+
 # Where screenshots will be saved
 SAVE_FOLDER = Path.home() / "Downloads" / "PrevHub_Captures"
 SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -168,6 +187,16 @@ def draw_banner(frame, text, color):
                     scale, color, thickness)
 
 
+def point_distance_cm(row, cy, focal_px, tilt, drop_cm):
+    """Horizontal distance (cm) from the camera to a point seen at this image
+    row that sits drop_cm below the camera lens. Used only for the
+    standing-line check (not for the height)."""
+    angle_down = tilt + np.arctan((row - cy) / focal_px)
+    if angle_down <= np.radians(1.0):      # at/above the horizon: not usable
+        return None
+    return drop_cm / np.tan(angle_down)
+
+
 def save_screenshot(frame, name):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = SAVE_FOLDER / f"{name}_{timestamp}.png"
@@ -213,6 +242,7 @@ if not cap.isOpened():
 print("PREV-HUB HEIGHT TRACKER STARTED")
 print("Keep the booth empty until the screen says CALIBRATED.")
 print("Keys (click the camera window first):")
+print("  L = set standing line (stand with the middle of your feet on the tape)")
 print("  S = manual screenshot   C = recalibrate   Q = quit")
 
 # Resizable window (rotated image is tall)
@@ -238,6 +268,12 @@ missing_count = RESET_FRAMES
 captures = []            # measurements for the current patient (cm)
 final_height_cm = None   # result once all captures are done
 final_saved = False      # final screenshot already written for this patient
+
+feet_row_history = deque(maxlen=15)   # ankle row, for teaching the line
+line_distance_cm = None               # taught standing line (cm from camera)
+recent_focal = deque(maxlen=15)       # live tag readings while booth is empty
+recent_tilt = deque(maxlen=15)
+camera_moved_msg = 0                  # frames left to show "CAMERA MOVED"
 
 # ============================================
 # MAIN CAMERA LOOP
@@ -268,6 +304,7 @@ try:
 
         tag_found = False
         tag_pts = None
+        live_focal = live_tilt = None
 
         if detector is not None:
 
@@ -330,6 +367,9 @@ try:
                         if len(focal_history) < CALIBRATION_FRAMES:
                             focal_history.append(f_est)
                             tilt_history.append(tilt_est)
+                        else:
+                            # Calibrated: keep live readings to detect a moved camera
+                            live_focal, live_tilt = f_est, tilt_est
 
                         tag_found = True
 
@@ -368,6 +408,7 @@ try:
         person_seen = results.pose_landmarks is not None
         full_body = False
         height_now = None
+        line_offset_cm = None    # + = behind the line, - = in front of it
 
         if person_seen:
 
@@ -443,6 +484,28 @@ try:
                     cv2.circle(frame, (center_x, head_top_y), 6, (0, 0, 255), -1)
                     cv2.circle(frame, (center_x, min(feet_y, h - 4)), 6, (0, 0, 255), -1)
 
+                    # ---- STANDING LINE CHECK (ankles) ----
+                    # The line is taught with the middle of the feet on the
+                    # tape, so the remembered ankle spot already includes the
+                    # ankle-to-mid-foot distance.
+                    ankle_row = (left_ankle.y + right_ankle.y) / 2 * h
+                    ankle_drop_cm = cam_h_cm - ANKLE_HEIGHT_CM
+
+                    if ankle_row < h:
+                        feet_row_history.append(ankle_row)
+
+                    if calibrated and line_distance_cm is not None:
+                        if ankle_row >= h - 2:
+                            # Ankles are below the bottom of the picture:
+                            # the patient is standing too close
+                            line_offset_cm = -99.0
+                        else:
+                            ankle_dist = point_distance_cm(
+                                ankle_row, cy, focal_px, tilt_used, ankle_drop_cm
+                            )
+                            if ankle_dist is not None:
+                                line_offset_cm = ankle_dist - line_distance_cm
+
                     if focal_px is not None:
                         # Angle of the head-top pixel below the image center
                         angle_down = tilt_used + np.arctan((head_top_y - cy) / focal_px)
@@ -471,12 +534,20 @@ try:
             final_saved = False
             height_history.clear()
 
+        off_line = (
+            line_offset_cm is not None
+            and abs(line_offset_cm) > LINE_TOLERANCE_CM
+        )
+        if off_line:
+            height_history.clear()     # wait until the patient is back on the line
+
         measuring = (
             full_body
             and calibrated
             and height_now is not None
             and final_height_cm is None
             and present_count > WARMUP_FRAMES
+            and not off_line
         )
 
         pending_shot = None      # screenshot to save after the screen is drawn
@@ -508,12 +579,40 @@ try:
                 pending_shot = None    # the FINAL screenshot covers the last capture
 
         # ------------------------------------
+        # CAMERA-MOVED CHECK (only while the booth is empty)
+        # ------------------------------------
+
+        if calibrated and not person_seen and live_focal is not None:
+            recent_focal.append(live_focal)
+            recent_tilt.append(live_tilt)
+            if len(recent_focal) == recent_focal.maxlen:
+                tilt_change = abs(np.degrees(np.median(recent_tilt) - tilt_used))
+                focal_change = abs(np.median(recent_focal) / focal_px - 1) * 100
+                if (AUTO_TILT and tilt_change > MOVED_TILT_DEG) or focal_change > MOVED_FOCAL_PCT:
+                    print(f"CAMERA MOVED (tilt change {tilt_change:.2f} deg, "
+                          f"zoom change {focal_change:.1f}%) - recalibrating.")
+                    focal_history.clear()
+                    tilt_history.clear()
+                    recent_focal.clear()
+                    recent_tilt.clear()
+                    camera_moved_msg = 90
+                    calibrated = False
+        elif person_seen:
+            recent_focal.clear()
+            recent_tilt.clear()
+
+        # ------------------------------------
         # STAFF INFO PANEL (top left)
         # ------------------------------------
 
-        cv2.rectangle(frame, (5, 5), (min(w - 5, 470), 160), (25, 25, 25), -1)
+        cv2.rectangle(frame, (5, 5), (min(w - 5, 470), 185), (25, 25, 25), -1)
 
-        if not focal_history:
+        if camera_moved_msg > 0:
+            camera_moved_msg -= 1
+
+        if camera_moved_msg > 0 and not calibrated:
+            cal_text = "CAMERA MOVED - RECALIBRATING"
+        elif not focal_history:
             cal_text = "SHOW APRILTAG TO CALIBRATE"
         elif not calibrated:
             cal_text = f"CALIBRATING {len(focal_history)}/{CALIBRATION_FRAMES}"
@@ -541,6 +640,17 @@ try:
             cv2.putText(frame, f"Captures (cm): {cap_text}", (15, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        if line_distance_cm is None:
+            line_text = "Line: not set - press L"
+        elif line_offset_cm is None:
+            line_text = "Line: set"
+        else:
+            line_text = ("Line: set  ankles below picture (too close)"
+                         if line_offset_cm <= -99 else
+                         f"Line: set  feet {line_offset_cm:+.1f} cm")
+        cv2.putText(frame, line_text, (15, 165),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
         # ------------------------------------
         # PATIENT INSTRUCTIONS (big banner, bottom)
         # ------------------------------------
@@ -551,9 +661,13 @@ try:
             imp, _ = format_height(final_height_cm)
             draw_banner(frame, f"DONE!  {imp}\nYou may step off", (0, 255, 0))
         elif not person_seen:
-            draw_banner(frame, "STEP ON THE LINE\nFace the camera", (255, 255, 255))
+            draw_banner(frame, "STAND ON THE LINE\nMiddle of feet on the line", (255, 255, 255))
         elif not full_body:
             draw_banner(frame, "STEP BACK ONTO THE LINE\nWhole body in view", (0, 165, 255))
+        elif off_line and line_offset_cm < 0:
+            draw_banner(frame, "STEP BACK\nMiddle of feet on the line", (0, 165, 255))
+        elif off_line:
+            draw_banner(frame, "STEP FORWARD\nMiddle of feet on the line", (0, 165, 255))
         else:
             n = len(captures) + 1
             progress = len(height_history) / STABLE_FRAMES
@@ -592,6 +706,23 @@ try:
             focal_history.clear()
             tilt_history.clear()
             print("Recalibrating: keep the booth empty so the AprilTag is visible.")
+
+        elif key == ord("l"):
+            if not calibrated:
+                print("Can't set the line yet: wait until the screen says CALIBRATED.")
+            elif len(feet_row_history) < 5:
+                print("Can't set the line: stand on the tape with your ankles clearly visible.")
+            else:
+                taught = point_distance_cm(
+                    float(np.median(feet_row_history)), cy, focal_px, tilt_used,
+                    cam_h_cm - ANKLE_HEIGHT_CM
+                )
+                if taught is None:
+                    print("Can't set the line: ankles not clearly in view.")
+                else:
+                    line_distance_cm = taught
+                    print("Standing line set. Patients will be asked to step back/forward "
+                          f"if they're more than {LINE_TOLERANCE_CM:.0f} cm off it.")
 
         elif key == ord("s"):
             shot = save_screenshot(frame, "manual_capture")
