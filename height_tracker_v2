@@ -661,13 +661,13 @@ try:
             imp, _ = format_height(final_height_cm)
             draw_banner(frame, f"DONE!  {imp}\nYou may step off", (0, 255, 0))
         elif not person_seen:
-            draw_banner(frame, "STAND ON THE LINE\nMiddle of feet on the line", (255, 255, 255))
+            draw_banner(frame, "STAND ON THE FOOTPRINTS\nFace the camera", (255, 255, 255))
         elif not full_body:
-            draw_banner(frame, "STEP BACK ONTO THE LINE\nWhole body in view", (0, 165, 255))
+            draw_banner(frame, "STEP BACK ONTO THE FOOTPRINTS\nWhole body in view", (0, 165, 255))
         elif off_line and line_offset_cm < 0:
-            draw_banner(frame, "STEP BACK\nMiddle of feet on the line", (0, 165, 255))
+            draw_banner(frame, "STEP BACK\nFeet on the footprints", (0, 165, 255))
         elif off_line:
-            draw_banner(frame, "STEP FORWARD\nMiddle of feet on the line", (0, 165, 255))
+            draw_banner(frame, "STEP FORWARD\nFeet on the footprints", (0, 165, 255))
         else:
             n = len(captures) + 1
             progress = len(height_history) / STABLE_FRAMES
