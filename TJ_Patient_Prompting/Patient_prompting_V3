@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""
+Verbal_Instructions_V3.py  -  Camera-guided patient intake with recorded voice prompts + on-screen text
+
+What changed from V2
+  * NEW: PatientDisplay shows every spoken prompt as large, high-contrast text on a second
+    (patient-facing) monitor, synced to the moment each clip starts. Edit the wording in CAPTIONS.
+    Corrections show in yellow, success in green. The operator window (camera + overlay) is unchanged.
+
+What changed from V1
+  * Text-to-speech is replaced by clips cut from V1_Patient_Prompts.mp3 (see CLIPS).
+  * The simulated sensor flags are replaced by real detection: body pose (MediaPipe) on the
+    Orbbec color stream, plus the aligned depth stream for distance to the camera.
+  * time.sleep() is gone. Audio plays in the background, so video never freezes and the
+    system never talks over itself.
+  * Movement-based corrections: feet apart, arms away from sides, slouching, and moving
+    during the measurement each trigger their own recorded correction clip.
+  * Audio clips are available three ways: play (VoicePlayer), get (AudioClipLibrary.get),
+    or export to WAV files (--export-clips DIR).
+
+Install
+  pip install pyorbbecsdk2 mediapipe opencv-python pygame numpy
+  (MediaPipe >= 0.10.30 removed the old "solutions" API. This script supports both. With a
+   newer MediaPipe, download pose_landmarker_lite.task and pass --pose-model path/to/it.)
+
+Run
+  python Verbal_Instructions_V3.py                    # Orbbec camera, shows a window
+  python Verbal_Instructions_V3.py --source webcam    # test with a normal webcam
+  python Verbal_Instructions_V3.py --preview          # play every clip + its text in order, no camera
+  python Verbal_Instructions_V3.py --export-clips clips/
+  python Verbal_Instructions_V3.py --display-index 1  # put the patient text on monitor 2
+  python Verbal_Instructions_V3.py --patient-windowed # patient text in a window (testing)
+  python Verbal_Instructions_V3.py --no-patient-display
+  Press Esc in the patient display window to quit.
+  Press q in the video window (or Ctrl+C) to quit.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import time
+import wave
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import pygame
+
+try:
+    import mediapipe as mp
+    HAS_MEDIAPIPE = True
+except ImportError:
+    mp = None
+    HAS_MEDIAPIPE = False
+
+try:
+    from pyorbbecsdk import (Config, OBAlignMode, OBFormat, OBFrameAggregateOutputMode,
+                             OBSensorType, Pipeline)
+    HAS_ORBBEC = True
+except ImportError:
+    HAS_ORBBEC = False
+
+
+# =============================================================================
+#  1. SETTINGS  (everything you are likely to tune lives here)
+# =============================================================================
+
+AUDIO_FILE = Path(__file__).with_name("V1_Patient_Prompts.mp3")
+
+# Clip name -> (start_seconds, end_seconds) inside the MP3.
+# Boundaries came from silence detection. The wording in the comments comes from a rough
+# offline speech-recognition pass, so run  --preview  once and listen to confirm each label.
+CLIPS: Dict[str, Tuple[float, float]] = {
+    "WELCOME":              (0.00, 1.98),    # "Welcome to the Preventative Care Hub."
+    "REMOVE_SHOES":         (3.47, 7.73),    # "Please remove your shoes ... we can get started."
+    "PROMPT_STATION_1":     (9.19, 14.31),   # "Please go to Station 1; it is marked on the floor ..."
+    "MEASUREMENT_OVERVIEW": (15.73, 19.08),  # "Here we will take your height, weight and waist measurements."
+    "STAND_ON_FOOTPRINTS":  (20.37, 24.20),  # "Please stand on the footprints and face the colored indicator ..."
+    "POSTURE_INSTRUCTIONS": (25.51, 29.97),  # "Please put your feet together, arms at your sides, stand up straight."
+    "MEASURING_START":      (31.38, 33.09),  # "Now we will take your measurements."
+    "SUCCESS_STATION_2":    (34.38, 37.48),  # "Success! Now move on to Station 2."
+    "STAND_STRAIGHT":       (38.85, 41.42),  # "Please stand up straight to the best of your ability."
+    "HOLD_STILL":           (42.83, 43.94),  # "Please hold still."
+    "FEET_TOGETHER":        (45.24, 46.64),  # "Please put your feet together."
+    "ARMS_AT_SIDES":        (47.88, 50.05),  # "Please place your arms at your sides."
+}
+CLIP_PAD_START = 0.05   # seconds of padding so word onsets are not clipped
+CLIP_PAD_END = 0.12     # seconds of padding so word endings are not clipped
+
+
+@dataclass
+class Settings:
+    # --- Station geometry (calibrate on site; the overlay shows the box and live ankle position)
+    footprint_box: Tuple[float, float, float, float] = (0.30, 0.70, 0.70, 1.00)  # x0,y0,x1,y1 normalized
+    station_depth_m: Tuple[float, float] = (1.0, 3.5)   # allowed distance from camera (needs depth)
+
+    # --- Pose thresholds (all ratios are relative to shoulder width, so they scale with distance)
+    min_visibility: float = 0.5
+    feet_together_max: float = 0.45     # ankle gap / shoulder width
+    arm_offset_max: float = 0.45        # wrist-to-hip sideways gap / shoulder width
+    torso_tilt_max_deg: float = 8.0     # shoulder-mid to hip-mid line vs vertical
+    shoulder_level_max: float = 0.12    # left/right shoulder height difference / shoulder width
+    head_offset_max: float = 0.30       # nose sideways offset from shoulder-mid / shoulder width
+    still_speed_max: float = 0.25       # body movement in shoulder-widths per second
+    facing_depth_ratio_max: float = 0.60  # shoulder depth difference / shoulder width
+
+    # --- Timing (seconds)
+    hold_to_confirm: float = 1.0        # a condition must hold this long before the step advances
+    correction_delay: float = 1.5       # how long something must be wrong before we speak
+    correction_cooldown: float = 6.0    # minimum time between spoken corrections
+    instruction_grace: float = 1.0      # quiet time after an instruction before correcting
+    reminder_interval: float = 12.0     # repeat "stand on the footprints" if nobody moves
+    measure_hold: float = 4.0           # how long the patient must stay still to measure
+    abandon_timeout: float = 8.0        # no person in view for this long -> reset to IDLE
+    leave_footprints_timeout: float = 2.0
+    finish_reset_delay: float = 5.0     # after success, wait this long with nobody in view -> IDLE
+
+
+# Spoken script. "clips" play in order; "next" + "pause_after" advance automatically once the
+# audio has finished. States without "next" advance from camera conditions (see update()).
+SCRIPT: Dict[str, dict] = {
+    "WELCOME":                   {"clips": ["WELCOME"], "next": "REMOVE_SHOES", "pause_after": 0.6},
+    "REMOVE_SHOES":              {"clips": ["REMOVE_SHOES"], "next": "PROMPT_STATION_1", "pause_after": 3.0},
+    "PROMPT_STATION_1":          {"clips": ["PROMPT_STATION_1"], "next": "MEASUREMENT_OVERVIEW", "pause_after": 0.5},
+    "MEASUREMENT_OVERVIEW":      {"clips": ["MEASUREMENT_OVERVIEW"], "next": "WAIT_FOR_PATIENT_POSITION", "pause_after": 0.5},
+    "WAIT_FOR_PATIENT_POSITION": {"clips": ["STAND_ON_FOOTPRINTS"]},
+    "POSTURE_ALIGNMENT":         {"clips": ["POSTURE_INSTRUCTIONS"]},
+    "MEASURING":                 {"clips": ["MEASURING_START", "HOLD_STILL"]},
+    "SUCCESS_STATION_2":         {"clips": ["SUCCESS_STATION_2"], "next": "COMPLETED", "pause_after": 1.0},
+}
+
+# On-screen text shown while each clip plays (and kept up until the next clip starts).
+# Long sentences wrap and shrink automatically. Use \n only to separate sentences or list items.
+# Wording for REMOVE_SHOES, PROMPT_STATION_1 and STAND_ON_FOOTPRINTS was cut off in the clip notes
+# above, so run --preview and make these match what the recording actually says.
+CAPTIONS: Dict[str, str] = {
+    "WELCOME":              "Welcome to the Preventative Care Hub.",
+    "REMOVE_SHOES":         "Please remove your shoes so we can get started.",
+    "PROMPT_STATION_1":     "Please go to Station 1.\nIt is marked on the floor.",
+    "MEASUREMENT_OVERVIEW": "Here we will take your height, weight, and waist measurements.",
+    "STAND_ON_FOOTPRINTS":  "Please stand on the footprints and face the colored indicator.",
+    "POSTURE_INSTRUCTIONS": "Feet together\nArms at your sides\nStand up straight",
+    "MEASURING_START":      "Now we will take your measurements.",
+    "SUCCESS_STATION_2":    "Success!\nNow move on to Station 2.",
+    "STAND_STRAIGHT":       "Please stand up straight to the best of your ability.",
+    "HOLD_STILL":           "Please hold still.",
+    "FEET_TOGETHER":        "Please put your feet together.",
+    "ARMS_AT_SIDES":        "Please place your arms at your sides.",
+}
+IDLE_TEXT = "Preventative Care Hub\nPlease step up to begin."
+CORRECTION_CLIPS = {"STAND_STRAIGHT", "HOLD_STILL", "FEET_TOGETHER", "ARMS_AT_SIDES"}   # yellow text
+SUCCESS_CLIPS = {"SUCCESS_STATION_2"}                                                  # green text
+
+
+# =============================================================================
+#  2. AUDIO: cut clips from the MP3, return them, play them, export them
+# =============================================================================
+
+class AudioClipLibrary:
+    """Loads the MP3 once and cuts it into named, playable clips."""
+
+    def __init__(self, audio_path: Path, clips: Dict[str, Tuple[float, float]],
+                 pad_start: float = CLIP_PAD_START, pad_end: float = CLIP_PAD_END):
+        if not Path(audio_path).exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        if pygame.mixer.get_init() is None:
+            pygame.mixer.init(frequency=44100, size=-16, channels=1)
+        self.frequency, fmt, self.channels = pygame.mixer.get_init()
+        self._sample_width = abs(fmt) // 8
+        self._frame_bytes = self._sample_width * self.channels
+
+        full = pygame.mixer.Sound(str(audio_path))
+        raw = full.get_raw()
+        total = full.get_length()
+
+        self._raw: Dict[str, bytes] = {}
+        self._sounds: Dict[str, pygame.mixer.Sound] = {}
+        for name, (start, end) in clips.items():
+            start = max(0.0, start - pad_start)
+            end = min(total, end + pad_end)
+            piece = raw[int(start * self.frequency) * self._frame_bytes:
+                        int(end * self.frequency) * self._frame_bytes]
+            self._raw[name] = piece
+            self._sounds[name] = pygame.mixer.Sound(buffer=piece)
+
+    def names(self) -> List[str]:
+        return list(self._sounds)
+
+    def get(self, name: str) -> pygame.mixer.Sound:
+        """Return a playable pygame Sound for this clip (call .play() on it)."""
+        return self._sounds[name]
+
+    def duration(self, name: str) -> float:
+        return self._sounds[name].get_length()
+
+    def export_all(self, out_dir: Path) -> List[Path]:
+        """Write every clip as its own WAV file and return the paths."""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for index, name in enumerate(self._raw, start=1):
+            path = out_dir / f"{index:02d}_{name}.wav"
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(self.channels)
+                wav.setsampwidth(self._sample_width)
+                wav.setframerate(self.frequency)
+                wav.writeframes(self._raw[name])
+            paths.append(path)
+        return paths
+
+
+class VoicePlayer:
+    """Non-blocking player with a queue. Never interrupts a clip that is already speaking."""
+
+    def __init__(self, library: AudioClipLibrary, gap: float = 0.25):
+        self.library = library
+        self.gap = gap
+        self.queue: Deque[str] = deque()
+        self.channel: Optional[pygame.mixer.Channel] = None
+        self.current: Optional[str] = None
+        self.last_clip: Optional[str] = None
+        self._was_busy = False
+        self._finished_at = time.monotonic()
+        self.on_start: Optional[Callable[[str], None]] = None   # called with the clip name as it starts
+
+    def say(self, *names: str, interrupt: bool = False) -> None:
+        if interrupt:
+            self.stop()
+        for name in names:
+            if name not in self.library.names():
+                raise KeyError(f"Unknown clip '{name}'")
+            self.queue.append(name)
+
+    def stop(self) -> None:
+        self.queue.clear()
+        if self.channel is not None:
+            self.channel.stop()
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.queue) or (self.channel is not None and self.channel.get_busy())
+
+    def silent_for(self) -> float:
+        """Seconds since the last clip finished (0 while audio is playing or queued)."""
+        return 0.0 if self.busy else time.monotonic() - self._finished_at
+
+    def update(self) -> None:
+        now = time.monotonic()
+        playing = self.channel is not None and self.channel.get_busy()
+        if self._was_busy and not playing:
+            self._finished_at = now
+        self._was_busy = playing
+        if not playing and self.queue and now - self._finished_at >= self.gap:
+            self.current = self.queue.popleft()
+            self.last_clip = self.current
+            self.channel = self.library.get(self.current).play()
+            self._was_busy = True
+            if self.on_start:
+                self.on_start(self.current)
+
+
+# =============================================================================
+#  2b. PATIENT DISPLAY: big, high-contrast text for the patient-facing monitor
+# =============================================================================
+
+class PatientDisplay:
+    """Fullscreen text display (pygame). Call update() every loop; it only redraws on change."""
+
+    COLORS = {"normal": (255, 255, 255), "correction": (255, 212, 0), "success": (76, 224, 107)}
+    HEADER = "Preventative Care Hub"
+
+    def __init__(self, captions: Dict[str, str], idle_text: str = "", display_index: int = 0,
+                 windowed: bool = False, max_font: int = 150, min_font: int = 40):
+        pygame.display.init()
+        pygame.font.init()
+        if windowed:
+            self.screen = pygame.display.set_mode((1280, 720))
+        else:
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=display_index)
+        pygame.display.set_caption("Patient Display")
+        pygame.mouse.set_visible(False)
+        self.W, self.H = self.screen.get_size()
+        self.captions = captions
+        self.idle_text = idle_text
+        self.max_font, self.min_font = max_font, min_font
+        self._fonts: Dict[int, pygame.font.Font] = {}
+        self._text, self._kind = idle_text, "normal"
+        self._dirty = True
+
+    def _font(self, size: int) -> pygame.font.Font:
+        if size not in self._fonts:
+            self._fonts[size] = pygame.font.SysFont("dejavusans,arial,helvetica,freesans", size, bold=True)
+        return self._fonts[size]
+
+    @staticmethod
+    def _wrap(text: str, font: pygame.font.Font, max_w: int) -> List[str]:
+        lines: List[str] = []
+        for paragraph in text.split("\n"):
+            current = ""
+            for word in paragraph.split():
+                trial = f"{current} {word}".strip()
+                if current and font.size(trial)[0] > max_w:
+                    lines.append(current)
+                    current = word
+                else:
+                    current = trial
+            lines.append(current)
+        return lines
+
+    def _draw(self) -> None:
+        self.screen.fill((0, 0, 0))
+        header_font = self._font(max(20, self.H // 26))
+        header = header_font.render(self.HEADER, True, (130, 130, 130))
+        self.screen.blit(header, ((self.W - header.get_width()) // 2, self.H // 30))
+
+        max_w, max_h = int(self.W * 0.90), int(self.H * 0.70)
+        for size in range(self.max_font, self.min_font - 1, -4):
+            font = self._font(size)
+            lines = self._wrap(self._text, font, max_w)
+            if len(lines) * font.get_linesize() <= max_h and all(font.size(l)[0] <= max_w for l in lines):
+                break
+        color = self.COLORS[self._kind]
+        y = (self.H - len(lines) * font.get_linesize()) // 2
+        for line in lines:
+            surface = font.render(line, True, color)
+            self.screen.blit(surface, ((self.W - surface.get_width()) // 2, y))
+            y += font.get_linesize()
+        pygame.display.flip()
+
+    # ---- public API ----
+    def show(self, text: str, kind: str = "normal") -> None:
+        if (text, kind) != (self._text, self._kind):
+            self._text, self._kind = text, kind
+            self._dirty = True
+
+    def show_clip(self, name: str) -> None:
+        """Pass this to VoicePlayer.on_start so text appears the moment the audio starts."""
+        if name not in self.captions:
+            return
+        kind = "correction" if name in CORRECTION_CLIPS else "success" if name in SUCCESS_CLIPS else "normal"
+        self.show(self.captions[name], kind)
+
+    def show_idle(self) -> None:
+        self.show(self.idle_text)
+
+    def update(self) -> bool:
+        """Pump window events and redraw if needed. Returns False if the window was closed (Esc)."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                return False
+        if self._dirty:
+            self._draw()
+            self._dirty = False
+        return True
+
+    def close(self) -> None:
+        pygame.display.quit()
+
+
+# =============================================================================
+#  3. CAMERA SOURCES: Orbbec (color + aligned depth), or a webcam / video file for testing
+# =============================================================================
+
+@dataclass
+class FrameBundle:
+    color_bgr: np.ndarray
+    depth_m: Optional[np.ndarray] = None    # same scene as color, in meters (0 = no reading)
+
+    def distance_at(self, nx: float, ny: float, radius: int = 7) -> Optional[float]:
+        """Median depth in meters around a normalized image point, or None."""
+        if self.depth_m is None:
+            return None
+        h, w = self.depth_m.shape
+        cx, cy = int(np.clip(nx, 0, 1) * (w - 1)), int(np.clip(ny, 0, 1) * (h - 1))
+        patch = self.depth_m[max(0, cy - radius):cy + radius + 1, max(0, cx - radius):cx + radius + 1]
+        valid = patch[patch > 0]
+        return float(np.median(valid)) if valid.size else None
+
+
+def _orbbec_color_to_bgr(frame) -> np.ndarray:
+    """Convert an Orbbec color frame (any common format) to an OpenCV BGR image."""
+    w, h, fmt = frame.get_width(), frame.get_height(), frame.get_format()
+    data = np.frombuffer(frame.get_data(), dtype=np.uint8)
+    if fmt == OBFormat.RGB:
+        return cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+    if fmt == OBFormat.BGR:
+        return data.reshape(h, w, 3).copy()
+    if fmt == OBFormat.MJPG:
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if fmt in (OBFormat.YUYV, OBFormat.YUY2):
+        return cv2.cvtColor(data.reshape(h, w, 2), cv2.COLOR_YUV2BGR_YUY2)
+    if fmt == OBFormat.UYVY:
+        return cv2.cvtColor(data.reshape(h, w, 2), cv2.COLOR_YUV2BGR_UYVY)
+    if fmt == OBFormat.I420:
+        return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_I420)
+    if fmt == OBFormat.NV12:
+        return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_NV12)
+    if fmt == OBFormat.NV21:
+        return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_NV21)
+    raise RuntimeError(f"Unsupported Orbbec color format: {fmt}")
+
+
+class OrbbecSource:
+    """Gemini 335 color stream plus depth aligned to color (software D2C)."""
+
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30):
+        if not HAS_ORBBEC:
+            raise RuntimeError("pyorbbecsdk is not installed (pip install pyorbbecsdk2)")
+        self.pipeline = Pipeline()
+        self.has_depth = False
+        try:
+            self._start(width, height, fps, with_depth=True)
+            self.has_depth = True
+        except Exception as error:   # fall back to color only
+            print(f"[camera] depth/alignment unavailable ({error}); continuing with color only")
+            self.pipeline = Pipeline()
+            self._start(width, height, fps, with_depth=False)
+
+    def _start(self, width: int, height: int, fps: int, with_depth: bool) -> None:
+        config = Config()
+        color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        color_profile = None
+        for fmt in (OBFormat.RGB, OBFormat.MJPG, OBFormat.BGR):
+            try:
+                color_profile = color_profiles.get_video_stream_profile(width, height, fmt, fps)
+                break
+            except Exception:
+                continue
+        if color_profile is None:
+            color_profile = color_profiles.get_default_video_stream_profile()
+        config.enable_stream(color_profile)
+        if with_depth:
+            depth_profiles = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+            config.enable_stream(depth_profiles.get_default_video_stream_profile())
+            config.set_align_mode(OBAlignMode.SW_MODE)
+            config.set_frame_aggregate_output_mode(OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE)
+        self.pipeline.start(config)
+
+    def read(self) -> Optional[FrameBundle]:
+        frames = self.pipeline.wait_for_frames(200)
+        if frames is None:
+            return None
+        color = frames.get_color_frame()
+        if color is None:
+            return None
+        bgr = _orbbec_color_to_bgr(color)
+        depth_m = None
+        if self.has_depth:
+            depth = frames.get_depth_frame()
+            if depth is not None:
+                w, h = depth.get_width(), depth.get_height()
+                raw = np.frombuffer(depth.get_data(), dtype=np.uint16)
+                if raw.size == w * h:
+                    # raw units * scale = millimeters -> /1000 = meters
+                    depth_m = raw.reshape(h, w).astype(np.float32) * depth.get_depth_scale() / 1000.0
+        return FrameBundle(bgr, depth_m)
+
+    def close(self) -> None:
+        self.pipeline.stop()
+
+
+class WebcamSource:
+    """Any OpenCV source: webcam index or a video file path. No depth."""
+
+    def __init__(self, index="0"):
+        self.cap = cv2.VideoCapture(int(index) if str(index).isdigit() else str(index))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open video source {index!r}")
+
+    def read(self) -> Optional[FrameBundle]:
+        ok, frame = self.cap.read()
+        return FrameBundle(frame) if ok else None
+
+    def close(self) -> None:
+        self.cap.release()
+
+
+# =============================================================================
+#  4. POSE DETECTION AND MOVEMENT ANALYSIS
+# =============================================================================
+
+# MediaPipe pose landmark indices
+NOSE, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST = 0, 11, 12, 13, 14, 15, 16
+L_HIP, R_HIP, L_KNEE, R_KNEE, L_ANKLE, R_ANKLE = 23, 24, 25, 26, 27, 28
+SKELETON = [(L_SHOULDER, R_SHOULDER), (L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST),
+            (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST), (L_SHOULDER, L_HIP), (R_SHOULDER, R_HIP),
+            (L_HIP, R_HIP), (L_HIP, L_KNEE), (L_KNEE, L_ANKLE), (R_HIP, R_KNEE), (R_KNEE, R_ANKLE)]
+
+Landmark = Tuple[float, float, float, float]   # x, y (normalized), z (relative), visibility
+
+
+class PoseBackend:
+    """Returns 33 (x, y, z, visibility) landmarks for one person, or None."""
+
+    def __init__(self, model_path: Optional[str] = None):
+        if not HAS_MEDIAPIPE:
+            raise RuntimeError("mediapipe is not installed (pip install mediapipe)")
+        self._legacy = None
+        self._task = None
+        self._last_ts = 0
+        if hasattr(mp, "solutions") and hasattr(mp.solutions, "pose"):
+            self._legacy = mp.solutions.pose.Pose(model_complexity=1, smooth_landmarks=True,
+                                                  min_detection_confidence=0.5,
+                                                  min_tracking_confidence=0.5)
+            self.name = "mediapipe (solutions API)"
+        else:
+            if not model_path:
+                raise RuntimeError(
+                    "This MediaPipe version needs a model file. Download pose_landmarker_lite.task "
+                    "from the MediaPipe model page and pass --pose-model path/to/it.task")
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+            options = vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.VIDEO, num_poses=1)
+            self._task = vision.PoseLandmarker.create_from_options(options)
+            self.name = "mediapipe (tasks API)"
+
+    def detect(self, bgr: np.ndarray) -> Optional[List[Landmark]]:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if self._legacy is not None:
+            result = self._legacy.process(rgb)
+            if not result.pose_landmarks:
+                return None
+            points = result.pose_landmarks.landmark
+        else:
+            self._last_ts = max(self._last_ts + 1, int(time.monotonic() * 1000))
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self._task.detect_for_video(image, self._last_ts)
+            if not result.pose_landmarks:
+                return None
+            points = result.pose_landmarks[0]
+        return [(p.x, p.y, p.z, p.visibility) for p in points]
+
+
+@dataclass
+class PoseMetrics:
+    """What the camera currently sees. Keys mirror the V1 'camera_data' flags, plus new ones."""
+    person_present: bool = False
+    full_body_visible: bool = False
+    patient_on_footprints: bool = False
+    facing_camera: bool = False
+    feet_together: bool = False
+    arms_at_sides: bool = False
+    posture_straight: bool = False
+    is_still: bool = False
+    distance_m: Optional[float] = None
+    details: Dict[str, float] = field(default_factory=dict)
+
+
+class PoseAnalyzer:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self._history: Deque[Tuple[float, np.ndarray, float]] = deque()  # (time, points, shoulder_w)
+
+    def analyze(self, lms: Optional[Sequence[Landmark]], now: float,
+                distance_m: Optional[float] = None) -> PoseMetrics:
+        m = PoseMetrics(distance_m=distance_m)
+        if lms is None:
+            self._history.clear()
+            return m
+        s = self.s
+        vis = lambda i: lms[i][3] >= s.min_visibility
+        xy = lambda i: np.array(lms[i][:2], dtype=float)
+
+        core = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP]
+        m.person_present = all(vis(i) for i in core)
+        if not m.person_present:
+            self._history.clear()
+            return m
+        m.full_body_visible = all(vis(i) for i in (L_ANKLE, R_ANKLE)) and \
+            max(lms[L_ANKLE][1], lms[R_ANKLE][1]) < 1.0
+
+        shoulder_w = max(float(np.linalg.norm(xy(L_SHOULDER) - xy(R_SHOULDER))), 1e-3)
+        shoulder_mid = (xy(L_SHOULDER) + xy(R_SHOULDER)) / 2
+        hip_mid = (xy(L_HIP) + xy(R_HIP)) / 2
+        torso_len = max(float(np.linalg.norm(hip_mid - shoulder_mid)), 1e-3)
+
+        # Facing the camera: left shoulder appears on the image's right, and the shoulders are
+        # at about the same depth (a turned body has a large depth difference).
+        z_gap = abs(lms[L_SHOULDER][2] - lms[R_SHOULDER][2]) / shoulder_w
+        m.facing_camera = lms[L_SHOULDER][0] > lms[R_SHOULDER][0] and z_gap < s.facing_depth_ratio_max
+        m.details["shoulder_z_gap"] = z_gap
+
+        # Standing on the footprints: ankles inside the calibrated box (and distance if known)
+        if m.full_body_visible:
+            ankle_mid = (xy(L_ANKLE) + xy(R_ANKLE)) / 2
+            x0, y0, x1, y1 = s.footprint_box
+            in_box = x0 <= ankle_mid[0] <= x1 and y0 <= ankle_mid[1] <= y1
+            in_range = True if distance_m is None else s.station_depth_m[0] <= distance_m <= s.station_depth_m[1]
+            m.patient_on_footprints = bool(in_box and in_range)
+            m.details["ankle_x"], m.details["ankle_y"] = float(ankle_mid[0]), float(ankle_mid[1])
+
+            gap = float(np.linalg.norm(xy(L_ANKLE) - xy(R_ANKLE))) / shoulder_w
+            m.feet_together = gap <= s.feet_together_max
+            m.details["feet_gap"] = gap
+
+        # Arms at sides: each wrist close to its hip sideways and not raised above the hip
+        if vis(L_WRIST) and vis(R_WRIST):
+            offsets = [abs(lms[w][0] - lms[h][0]) / shoulder_w for w, h in ((L_WRIST, L_HIP), (R_WRIST, R_HIP))]
+            low_enough = all(lms[w][1] > lms[h][1] - 0.15 * torso_len for w, h in ((L_WRIST, L_HIP), (R_WRIST, R_HIP)))
+            m.arms_at_sides = max(offsets) <= s.arm_offset_max and low_enough
+            m.details["arm_offset"] = max(offsets)
+
+        # Posture: torso upright, shoulders level, head over shoulders
+        torso_vec = hip_mid - shoulder_mid
+        tilt = math.degrees(math.atan2(abs(torso_vec[0]), max(torso_vec[1], 1e-6)))
+        level = abs(lms[L_SHOULDER][1] - lms[R_SHOULDER][1]) / shoulder_w
+        head = abs(lms[NOSE][0] - shoulder_mid[0]) / shoulder_w if vis(NOSE) else 0.0
+        m.posture_straight = tilt <= s.torso_tilt_max_deg and level <= s.shoulder_level_max and head <= s.head_offset_max
+        m.details.update(tilt_deg=tilt, shoulder_level=level, head_offset=head)
+
+        # Stillness: average movement of head/shoulders/hips over the last ~0.6 s
+        pts = np.array([xy(i) for i in (NOSE, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP)])
+        self._history.append((now, pts, shoulder_w))
+        while self._history and now - self._history[0][0] > 0.6:
+            self._history.popleft()
+        if len(self._history) >= 4 and now - self._history[0][0] >= 0.4:
+            path = sum(float(np.mean(np.linalg.norm(b[1] - a[1], axis=1))) / shoulder_w
+                       for a, b in zip(self._history, list(self._history)[1:]))
+            speed = path / (now - self._history[0][0])
+            m.is_still = speed <= s.still_speed_max
+            m.details["speed"] = speed
+        return m
+
+
+# =============================================================================
+#  5. STATE MACHINE  (same state names as V1, driven by the camera instead of timers)
+# =============================================================================
+
+class IntakeStateMachine:
+    def __init__(self, player: VoicePlayer, settings: Settings, on_measure=None):
+        self.player = player
+        self.s = settings
+        self.on_measure = on_measure          # called once with PoseMetrics when measuring succeeds
+        self.state = "IDLE"
+        self.entered_at = time.monotonic()
+        self._since: Dict[str, float] = {}
+        self._last_correction = -1e9
+        self._last_reminder = time.monotonic()
+        self._enter("IDLE", self.entered_at)
+
+    # ---- helpers -------------------------------------------------------------
+    def _enter(self, state: str, now: float) -> None:
+        self.state = state
+        self.entered_at = now
+        self._since.clear()
+        self._last_correction = now
+        self._last_reminder = now
+        clips = SCRIPT.get(state, {}).get("clips")
+        if clips:
+            self.player.say(*clips)
+        print(f"[state] {state}")
+
+    def _lasting(self, key: str, flag: bool, now: float) -> float:
+        """Seconds that `flag` has been continuously true (0 if false now)."""
+        if flag:
+            return now - self._since.setdefault(key, now)
+        self._since.pop(key, None)
+        return 0.0
+
+    def _correct(self, clip: str, now: float) -> None:
+        if not self.player.busy and now - self._last_correction >= self.s.correction_cooldown:
+            self.player.say(clip)
+            self._last_correction = now
+
+    # ---- main update ---------------------------------------------------------
+    def update(self, m: PoseMetrics, now: float) -> None:
+        s, state = self.s, self.state
+
+        # Reset if the patient walks away mid-session
+        away = self._lasting("away", not m.person_present, now)
+        if state not in ("IDLE", "COMPLETED") and away >= s.abandon_timeout:
+            self.player.stop()
+            self._enter("IDLE", now)
+            return
+
+        if state == "IDLE":
+            if self._lasting("present", m.person_present, now) >= s.hold_to_confirm:
+                self._enter("WELCOME", now)
+
+        elif "next" in SCRIPT.get(state, {}):   # timed, audio-only steps
+            cfg = SCRIPT[state]
+            if not self.player.busy and self.player.silent_for() >= cfg["pause_after"]:
+                self._enter(cfg["next"], now)
+
+        elif state == "WAIT_FOR_PATIENT_POSITION":
+            ready = m.patient_on_footprints and m.facing_camera
+            if self._lasting("ready", ready, now) >= s.hold_to_confirm:
+                self._enter("POSTURE_ALIGNMENT", now)
+            elif not self.player.busy and now - self._last_reminder >= s.reminder_interval:
+                self.player.say("STAND_ON_FOOTPRINTS")
+                self._last_reminder = now
+
+        elif state == "POSTURE_ALIGNMENT":
+            if self._lasting("off_mat", not m.patient_on_footprints, now) >= s.leave_footprints_timeout:
+                self._enter("WAIT_FOR_PATIENT_POSITION", now)
+                return
+            ok = m.feet_together and m.arms_at_sides and m.posture_straight
+            if self._lasting("ok", ok, now) >= s.hold_to_confirm:
+                self._enter("MEASURING", now)
+                return
+            if self.player.silent_for() >= s.instruction_grace:
+                # Speak about one problem at a time, most important first
+                problems = [(self._lasting("feet", not m.feet_together, now), "FEET_TOGETHER"),
+                            (self._lasting("arms", not m.arms_at_sides, now), "ARMS_AT_SIDES"),
+                            (self._lasting("posture", not m.posture_straight, now), "STAND_STRAIGHT")]
+                for duration, clip in problems:
+                    if duration >= s.correction_delay:
+                        self._correct(clip, now)
+                        break
+
+        elif state == "MEASURING":
+            if self._lasting("off_mat", not m.patient_on_footprints, now) >= s.leave_footprints_timeout:
+                self._enter("WAIT_FOR_PATIENT_POSITION", now)
+                return
+            if self.player.busy or self.player.silent_for() < s.instruction_grace:
+                self._since.pop("still", None)       # don't start timing until instructions end
+                return
+            if self._lasting("moving", not m.is_still, now) >= 0.5:
+                self._since.pop("still", None)
+                self._correct("HOLD_STILL", now)
+            if self._lasting("still", m.is_still and m.posture_straight, now) >= s.measure_hold:
+                if self.on_measure:
+                    self.on_measure(m)               # <-- hook for your real measurement code
+                self._enter("SUCCESS_STATION_2", now)
+
+        elif state == "COMPLETED":
+            if self._lasting("gone", not m.person_present, now) >= s.finish_reset_delay:
+                self._enter("IDLE", now)
+
+
+# =============================================================================
+#  6. OVERLAY + MAIN LOOP
+# =============================================================================
+
+def draw_overlay(frame: np.ndarray, lms, m: PoseMetrics, machine: IntakeStateMachine,
+                 player: VoicePlayer, settings: Settings) -> None:
+    h, w = frame.shape[:2]
+    x0, y0, x1, y1 = settings.footprint_box
+    cv2.rectangle(frame, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), (255, 200, 0), 2)
+    if lms:
+        for a, b in SKELETON:
+            if lms[a][3] > 0.5 and lms[b][3] > 0.5:
+                cv2.line(frame, (int(lms[a][0] * w), int(lms[a][1] * h)),
+                         (int(lms[b][0] * w), int(lms[b][1] * h)), (0, 255, 0), 2)
+    cv2.putText(frame, f"State: {machine.state}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    speaking = f"Playing: {player.current}" if player.busy else f"Last clip: {player.last_clip}"
+    cv2.putText(frame, speaking, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    checks = [("present", m.person_present), ("on footprints", m.patient_on_footprints),
+              ("facing", m.facing_camera), ("feet together", m.feet_together),
+              ("arms at sides", m.arms_at_sides), ("straight", m.posture_straight), ("still", m.is_still)]
+    for i, (label, ok) in enumerate(checks):
+        cv2.putText(frame, f"{label}: {'OK' if ok else 'no'}", (20, 100 + 24 * i),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0) if ok else (0, 0, 255), 2)
+    if m.distance_m is not None:
+        cv2.putText(frame, f"distance: {m.distance_m:.2f} m", (20, 100 + 24 * len(checks)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+
+def preview_clips(library: AudioClipLibrary, display: Optional[PatientDisplay] = None) -> None:
+    """Play every clip in order so you can confirm the labels in CLIPS and the text in CAPTIONS."""
+    player = VoicePlayer(library, gap=0.5)
+    if display:
+        player.on_start = display.show_clip
+    for name in library.names():
+        print(f"Playing {name}  ({library.duration(name):.2f} s)")
+        player.say(name)
+        while player.busy:
+            player.update()
+            if display and not display.update():
+                return
+            time.sleep(0.02)
+
+
+def run(args: argparse.Namespace) -> None:
+    settings = Settings()
+    if args.footprint_box:
+        settings.footprint_box = tuple(args.footprint_box)  # type: ignore[assignment]
+
+    library = AudioClipLibrary(Path(args.audio), CLIPS)
+    if args.export_clips:
+        for path in library.export_all(Path(args.export_clips)):
+            print("wrote", path)
+        return
+    display: Optional[PatientDisplay] = None
+    if not args.no_patient_display:
+        display = PatientDisplay(CAPTIONS, IDLE_TEXT, args.display_index, args.patient_windowed)
+    if args.preview:
+        preview_clips(library, display)
+        if display:
+            display.close()
+        return
+
+    use_orbbec = args.source == "orbbec" or (args.source == "auto" and HAS_ORBBEC)
+    source = OrbbecSource(args.width, args.height, args.fps) if use_orbbec else WebcamSource(args.cam_index)
+    backend = PoseBackend(args.pose_model)
+    print(f"[camera] {'Orbbec' if use_orbbec else 'OpenCV source'}   [pose] {backend.name}")
+
+    player = VoicePlayer(library)
+    if display:
+        player.on_start = display.show_clip
+    analyzer = PoseAnalyzer(settings)
+    machine = IntakeStateMachine(player, settings,
+                                 on_measure=lambda m: print("[measure] captured", m.details))
+    last_state = None
+    try:
+        while True:
+            bundle = source.read()
+            if bundle is None:
+                continue
+            now = time.monotonic()
+            lms = backend.detect(bundle.color_bgr)
+
+            distance = None
+            if lms is not None and lms[L_HIP][3] > 0.5 and lms[R_HIP][3] > 0.5:
+                distance = bundle.distance_at((lms[L_HIP][0] + lms[R_HIP][0]) / 2,
+                                              (lms[L_HIP][1] + lms[R_HIP][1]) / 2)
+            metrics = analyzer.analyze(lms, now, distance)
+            machine.update(metrics, now)
+            player.update()
+
+            if display:
+                if machine.state != last_state:
+                    last_state = machine.state
+                    if last_state == "IDLE":
+                        display.show_idle()
+                if not display.update():
+                    break
+
+            if not args.no_display:
+                draw_overlay(bundle.color_bgr, lms, metrics, machine, player, settings)
+                cv2.imshow("Preventative Care Hub - Vision Intake", bundle.color_bgr)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        player.stop()
+        source.close()
+        if display:
+            display.close()
+        cv2.destroyAllWindows()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Camera-guided intake with recorded voice prompts")
+    p.add_argument("--source", choices=["auto", "orbbec", "webcam"], default="auto")
+    p.add_argument("--cam-index", default="0", help="webcam index or video file path (webcam source)")
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--audio", default=str(AUDIO_FILE), help="path to V1_Patient_Prompts.mp3")
+    p.add_argument("--pose-model", default=None, help="pose_landmarker_lite.task (newer MediaPipe only)")
+    p.add_argument("--footprint-box", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
+                   help="normalized ankle zone for the footprints, e.g. 0.3 0.7 0.7 1.0")
+    p.add_argument("--no-display", action="store_true", help="headless mode (no operator video window)")
+    p.add_argument("--no-patient-display", action="store_true", help="disable the patient-facing text display")
+    p.add_argument("--display-index", type=int, default=0, help="monitor number for the patient text (0, 1, ...)")
+    p.add_argument("--patient-windowed", action="store_true", help="show patient text in a window, not fullscreen")
+    p.add_argument("--preview", action="store_true", help="play every clip in order, then exit")
+    p.add_argument("--export-clips", metavar="DIR", help="write each clip as a WAV file, then exit")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    try:
+        run(parse_args())
+    except (RuntimeError, FileNotFoundError) as error:
+        sys.exit(f"Error: {error}")
