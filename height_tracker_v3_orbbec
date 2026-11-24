@@ -1,0 +1,2000 @@
+import cv2
+import csv
+import math
+import time
+import numpy as np
+import mediapipe as mp
+from collections import deque
+from pathlib import Path
+from datetime import datetime
+
+try:
+    import pygame                  # plays the recorded voice prompts
+except ImportError:
+    pygame = None
+
+# ============================================
+# PREV-HUB AUTOMATIC HEIGHT TRACKER
+# Python 3.11.9 - Webcam Prototype
+# Runs by itself: patient steps on the line, holds still,
+# the program takes several measurements and shows the result.
+# NEW: recorded voice prompts say the on-screen instructions out loud.
+# ============================================
+
+# ============================================
+# ORBBEC GEMINI 335 VERSION
+# Uses the Orbbec's COLOR camera (it shows up as a normal webcam).
+# ============================================
+CAMERA_INDEX = 0                 # if the MacBook camera opens instead, try 1 (or 2)
+
+# PICTURE SIZE IN PIXELS - NOT something you measure with a tape.
+# Leave as None (the camera's own default). Optional: try 1280 / 720 for a
+# sharper picture; if the camera refuses, it goes back to the default by itself.
+PICTURE_WIDTH_PX = None
+PICTURE_HEIGHT_PX = None
+
+# Picture rotation.
+#   Orbbec standing normally (landscape):         ROTATE = None
+#   Orbbec mounted VERTICALLY (on its side):      ROTATE = cv2.ROTATE_90_CLOCKWISE
+# If people appear lying on their side, this is set wrong; if upside down,
+# use cv2.ROTATE_90_COUNTERCLOCKWISE instead.
+ROTATE = cv2.ROTATE_90_CLOCKWISE
+
+# TAPE MEASUREMENTS (below, in BOOTH GEOMETRY): the Orbbec has several lenses.
+# Measure CAMERA_HEIGHT_CM and all distances from the COLOR (RGB) lens.
+
+# --------------------------------------------
+# DISPLAY
+# --------------------------------------------
+WINDOW_WIDTH = 1280              # starting window width on screen (height follows the picture)
+START_FULLSCREEN = False         # True = fill the screen (F key toggles while running)
+PANEL_OPACITY = 0.65             # staff panel: 0 = see-through, 1 = solid
+SHOW_STAFF_PANEL = True          # H key hides/shows it while running
+
+# --------------------------------------------
+# TAG DETECTION (Orbbec tuning)
+# --------------------------------------------
+TAG_CONTRAST_BOOST = True        # evens out dim/uneven lighting before looking for tags
+TAG_ZOOM_SEARCH = True           # if a tag is missed, zoom in where it was last seen
+
+# --------------------------------------------
+# BOOTH GEOMETRY  (ALL IN CENTIMETERS - measure with a tape measure)
+# --------------------------------------------
+# Distances are HORIZONTAL, along the floor, from the camera lens.
+# Heights are measured straight up from the floor.
+# (inches x 2.54 = cm,  feet x 30.48 = cm)
+#
+#   NOW (MacBook test):  camera 112 cm, patient line 164.6 cm, tag 442 cm
+#   LATER (booth):       camera 198.1 cm (6.5 ft) high, tilted ~27.5 deg down,
+#                        patient 106.7 cm (3.5 ft) away,
+#                        tag 213.4 cm (7 ft) away
+
+CAMERA_HEIGHT_CM = 109.5         # floor -> camera lens          (later: 198.1)
+CAMERA_TILT_DEG = 0.0            # downward tilt, 0 = level      (later: 27.5)
+                                # (only a starting guess when AUTO_TILT = True)
+AUTO_TILT = True                 # measure the tilt from the AprilTag automatically
+PATIENT_DISTANCE_CM = 318.0      # camera -> where patient stands (later: 106.7)
+TAG_DISTANCE_CM = 497.0          # camera -> wall with the tag    (later: 213.4)
+TAG_CENTER_HEIGHT_CM = 163.0     # floor -> CENTER of the tag (measure it!)
+
+# AprilTag settings
+# Measure the outer BLACK square with a ruler. Printers often stretch
+# the tag slightly, so measure both directions as it hangs on the wall.
+TAG_WIDTH_CM = 16.0              # left-right (horizontal on the wall)
+TAG_HEIGHT_CM = 16.5             # top-bottom (vertical on the wall)
+TAG_ID = 0
+
+# SIDE OFFSETS (NEW) - only matter if your distances were taped DIAGONALLY.
+# The math needs the distance straight out in the direction the camera faces
+# (along the floor). If that's how you measured, leave DIAGONALLY = False and
+# the side offsets don't change anything.
+# If the tape went straight from the lens to the tag / to the footprints, set
+# DIAGONALLY = True and fill in how far left/right of the lens each one is:
+# the program then works out the straight-ahead distance itself.
+DISTANCES_MEASURED_DIAGONALLY = False
+TAG_SIDE_OFFSET_CM = 0.0         # tag center, sideways from the lens
+PATIENT_SIDE_OFFSET_CM = 0.0     # footprints center, sideways from the lens
+
+# --------------------------------------------
+# REFERENCE "RULER" TAGS  (NEW - most accurate, no people of known height needed)
+# --------------------------------------------
+# Tag 0 stays on the far wall (it measures the camera tilt/zoom).
+# Tags 1 and 2 go BESIDE the patient - NOT on the wall behind them:
+#   - same distance from the camera as the footprints
+#   - 40-60 cm to the left or right of the footprints (so arms don't cover them)
+#   - flat, facing the camera
+#   - tag 1 low (~145 cm to its center), tag 2 high (~190 cm to its center)
+# Every frame, the patient's head is read against these two tags like a ruler
+# standing next to them. This cancels errors in camera height, distances, zoom,
+# tilt and most lens distortion. If a patient blocks a tag, its last position is
+# kept. Until the tags are seen, the booth geometry is used (old behavior).
+USE_RULER_TAGS = True
+
+# >>> TYPE YOUR MEASUREMENTS HERE: floor -> CENTER of each tag, in cm <<<
+# (inches x 2.54 = cm). Measure carefully: this is now the number that
+# matters most for accuracy.
+RULER_TAG_1_CENTER_CM = 145.5    # LOW tag  (ID 1)
+RULER_TAG_2_CENTER_CM = 190.0    # HIGH tag (ID 2)
+
+# Size of tags 1 and 2 (both the same): measure the outer BLACK square as it
+# hangs on the wall. Used to check that the tags really are at the patient's
+# distance (shown on the staff panel), not for the height itself.
+RULER_TAG_WIDTH_CM = 15.0        # left-right
+RULER_TAG_HEIGHT_CM = 15.5       # top-bottom
+
+REF_TAGS = ({1: RULER_TAG_1_CENTER_CM, 2: RULER_TAG_2_CENTER_CM}
+            if USE_RULER_TAGS else {})
+# Distance from the camera lens to tags 1 and 2 (horizontal, along the floor, cm).
+#   On the same wall as tag 0  -> same number as TAG_DISTANCE_CM
+#   Beside the footprints      -> same number as PATIENT_DISTANCE_CM (most accurate)
+RULER_TAG_DISTANCE_CM = 497.0
+REF_HISTORY = 30                 # readings averaged per ruler tag
+
+# LIVE calibration: every frame the tag is visible, the tilt and zoom are
+# re-measured (median of the last 60 readings), so a change in camera tilt
+# is picked up automatically, even while a patient is being measured.
+# If the tag is hidden, the last readings are kept.
+CALIBRATION_FRAMES = 60          # rolling window of tag readings
+MIN_CALIBRATION_FRAMES = 30      # readings needed before measuring starts
+# If the newest readings show the camera clearly changed (tilt or zoom),
+# older readings are dropped so the program catches up right away.
+CHANGE_TILT_DEG = 0.3
+CHANGE_FOCAL_PCT = 2.0
+
+# --------------------------------------------
+# HEIGHT CORRECTION FROM PEOPLE OF KNOWN HEIGHT  (NEW - replaces factor/offset)
+# --------------------------------------------
+# After every patient the console prints "RAW: xxx.x cm" and the same number goes
+# into Downloads/PrevHub_Captures/height_log.csv. Measure a few people with a
+# tape measure (shoes off, against a wall), run them through, and add
+# (true_cm, raw_cm) pairs below:
+#   1 person    -> fixes a constant offset (your current 0.9 in)
+#   2-3 people  -> fixes offset + scale      ("tall people are off")
+#   4+ people   -> also bends the curve      (lens distortion near the top of the picture)
+# Spread them from your shortest to your tallest (e.g. 5'0, 5'6, 5'10, 6'2+).
+# Redo this whenever the camera, tag or footprints move.
+KNOWN_HEIGHTS = [
+    # (true_cm, raw_cm),
+    # (152.4, 151.1),
+    # (177.8, 175.2),
+]
+# Only used while KNOWN_HEIGHTS is empty:
+CALIBRATION_FACTOR = 1.0         # multiply (true / shown, if off by a %)
+HEIGHT_OFFSET_CM = 0.0           # add/subtract (if always off by same cm)
+
+# --------------------------------------------
+# PERSON DETECTION
+# --------------------------------------------
+# 0 = fast, 1 = balanced, 2 = most accurate (best marker feet/ankles).
+# The first run with 2 downloads a bigger model (needs internet once).
+# If the video becomes laggy, change to 1.
+MODEL_COMPLEXITY = 2
+
+# How sure MediaPipe must be that a body part is visible (0-1).
+# Ankles use a lower bar: shoes and the bottom edge of the frame
+# often make them uncertain, and the height math doesn't use the feet.
+BODY_VISIBILITY = 0.5
+ANKLE_VISIBILITY = 0.3
+
+# TOP OF HEAD (NEW knobs) - the camera sees the top of the HAIR through a
+# slightly blurry person outline, so it reads a little tall.
+MASK_THRESHOLD = 0.5             # outline edge (0-1). Higher = tighter outline,
+                                 # less blur above the head (try 0.6-0.7)
+HEAD_TOP_COVER = 0.15            # how much of the head column must be "person"
+                                 # to count as head. Higher ignores loose/flyaway
+                                 # hair on top (try 0.3-0.4)
+HEAD_TOP_OFFSET_CM = 1.0         # blur of the outline itself (cm). Short hair read
+                                 # 1.0 cm tall in testing (184.0 vs 183.0)
+
+# HAIR CHECK: the top of the SKULL is also estimated from the face
+# (eyes -> mouth distance, scaled). Short/flat hair: the outline is used
+# (most precise). If the outline sticks up more than HAIR_THRESHOLD_CM above
+# the face estimate, that's hair (long, thick, bun, ponytail on top) and the
+# face estimate is used instead.
+# Tested: long hair 152.5 cm true -> 152.9,  short hair 183.0 cm true -> 183.0
+HAIR_CHECK_ON = True
+SKULL_RATIO = 1.55               # eye -> top of skull = 1.55 x (eye -> mouth)
+HAIR_THRESHOLD_CM = 1.2          # more than this above the face estimate = hair
+
+# --------------------------------------------
+# AUTOMATIC MEASUREMENT
+# --------------------------------------------
+WARMUP_FRAMES = 15               # ignore the first frames after someone steps in
+                                 #   (tracking is still settling)
+STABLE_FRAMES = 30               # frames averaged for ONE measurement
+STABLE_TOLERANCE_CM = 1.0        # height must stay within this spread to count as "still"
+CAPTURES_PER_PATIENT = 3         # measurements taken per patient (final = median)
+MAX_SPREAD_CM = 2.5              # warn if the measurements disagree more than this
+RESET_FRAMES = 20                # frames with nobody in view before the next patient
+
+# Countdown shown to the patient for each of the 3 pictures (NEW)
+SHOW_COUNTDOWN = True            # big 3-2-1 number in the middle of the screen
+CAPTURE_FLASH_SEC = 1.0          # how long "PICTURE 1 OF 3 TAKEN" stays on screen
+
+# --------------------------------------------
+# STANDING LINE CHECK  (press L to teach the footprints)
+# --------------------------------------------
+# During setup, stand on the footprints and press L. The program remembers
+# that spot and asks patients to step back/forward if they're off it.
+# Not used in the height calculation (that still uses PATIENT_DISTANCE_CM).
+# The check uses the ANKLES: a front-facing camera can't see the heels,
+# and the toes drop below the bottom of the picture first.
+LINE_TOLERANCE_CM = 8.0          # how far off the footprints is still OK
+ANKLE_HEIGHT_CM = 8.0            # approx. height of the ankle bone above the floor
+# (NEW) Bigger people have bigger feet. The camera sees the TOES (front of the
+# feet), so a 6 ft person on a spot taught by a 5 ft person looked "too far
+# forward". The check now uses the CENTER of the foot: toes + half a foot length,
+# with foot length estimated from body height.
+FOOT_LENGTH_RATIO = 0.15         # foot length is about 15% of body height
+# (NEW) Press L once with a short person AND once with a tall person on the
+# footprints: the program then learns how the spot shifts with body size and
+# stops wrongly sending tall (or short) patients back/forward.
+# Press K to forget all taught spots.
+SPOT_MIN_HEIGHT_GAP_CM = 10.0    # taught people closer in height than this count as one
+# (NEW) Use where the feet actually are (within the tolerance above) as the
+# patient's distance, instead of always PATIENT_DISTANCE_CM. Standing 5 cm off
+# the footprints used to cost ~1 cm of height on a 6 ft person.
+USE_FEET_FOR_DISTANCE = True
+
+# Where screenshots will be saved
+SAVE_FOLDER = Path.home() / "Downloads" / "PrevHub_Captures"
+SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
+
+WINDOW_NAME = "PREV-HUB Automatic Height Tracker (Orbbec)"
+
+# --------------------------------------------
+# VOICE PROMPTS  (NEW)
+# --------------------------------------------
+# Put the AUDIO FILES in the SAME FOLDER as this program (e.g. the Desktop):
+#   TJ_V1_Patient_Prompts_Female.mp3    (female: all main prompts)
+#   TJ_V2_Patient_Prompts_Male.mp3      (male:   all main prompts)
+#   Female_Perfect.mp3                  ("Thank you, that's perfect. Now please hold still.")
+#   Female_Three_Pictures.mp3           ("We will take three pictures." "One." "Two.")
+#   Female_Shoulders_Knees.mp3          ("...relax your shoulders..." "...straighten your knees.")
+# Every clip is cut out of these files by its start/end time (no folders needed).
+# If a file can't be found, the program still runs, just without those clips.
+VOICE_ON = True
+VOICE = "female"                 # "male" or "female"  (or run with  --voice male / --voice female)
+
+import sys
+for _i, _arg in enumerate(sys.argv[1:], start=1):
+    if _arg == "--voice" and _i + 1 < len(sys.argv):
+        VOICE = sys.argv[_i + 1].lower()
+    elif _arg.startswith("--voice="):
+        VOICE = _arg.split("=", 1)[1].lower()
+if VOICE not in ("male", "female"):
+    print(f'Unknown voice "{VOICE}" - using female.')
+    VOICE = "female"
+
+HERE = Path(__file__).parent
+F_MAIN = "TJ_V1_Patient_Prompts_Female.mp3"
+M_MAIN = "TJ_V2_Patient_Prompts_Male.mp3"
+F_PERFECT = "Female_Perfect.mp3"
+F_PICTURES = "Female_Three_Pictures.mp3"
+F_POSTURE = "Female_Shoulders_Knees.mp3"
+
+# clip name -> (audio file, start sec, end sec)
+VOICES = {
+    "female": {
+        "WELCOME":             (F_MAIN, 0.00, 1.97),   # "Welcome to the Preventative Care Hub."
+        "REMOVE_SHOES":        (F_MAIN, 4.12, 8.47),   # "Please remove your shoes ..."
+        "STAND_ON_FOOTPRINTS": (F_MAIN, 21.72, 25.41), # "Please stand on the footprints and face ..."
+        "MEASURING_START":     (F_MAIN, 32.04, 33.86), # "Now we will take your measurements."
+        "SUCCESS_STATION_2":   (F_MAIN, 35.11, 37.90), # "Success! Now move on to Station 2."
+        "STAND_STRAIGHT":      (F_MAIN, 39.06, 41.70), # "Please stand up straight ..."
+        "HOLD_STILL":          (F_MAIN, 42.74, 43.88), # "Please hold still."
+        "REMOVE_HAT":          (F_MAIN, 50.70, 52.82), # "Please remove your hat if you're wearing one."
+        "STEP_BACK":           (F_MAIN, 53.86, 54.90), # "Please step back."
+        "STEP_FORWARD":        (F_MAIN, 56.10, 57.08), # "Please step forward."
+        "LOOK_AHEAD":          (F_MAIN, 58.26, 59.54), # "Please look straight ahead."
+        "MEASURE_AGAIN":       (F_MAIN, 60.72, 62.36), # "We will take your measurements again."
+        "PERFECT":             (F_PERFECT, 0.10, 3.42),   # "Thank you, that's perfect. Now please hold still."
+        "THREE_PICTURES":      (F_PICTURES, 0.02, 1.67),  # "We will take three pictures."
+        "ONE":                 (F_PICTURES, 3.14, 3.69),  # "One."
+        "TWO":                 (F_PICTURES, 4.99, 5.50),  # "Two."
+        "LEVEL_SHOULDERS":     (F_POSTURE, 0.04, 2.78),   # "Please relax your shoulders and keep them even."
+        "STRAIGHTEN_KNEES":    (F_POSTURE, 4.39, 5.70),   # "Please straighten your knees."
+    },
+    "male": {
+        "WELCOME":             (M_MAIN, 0.00, 2.05),
+        "REMOVE_SHOES":        (M_MAIN, 3.73, 7.87),
+        "STAND_ON_FOOTPRINTS": (M_MAIN, 21.30, 24.96),
+        "MEASURING_START":     (M_MAIN, 32.18, 33.87),
+        "SUCCESS_STATION_2":   (M_MAIN, 35.43, 38.20),
+        "STAND_STRAIGHT":      (M_MAIN, 39.80, 42.24),
+        "HOLD_STILL":          (M_MAIN, 43.64, 44.88),
+        "REMOVE_HAT":          (M_MAIN, 52.74, 54.92),
+        "STEP_BACK":           (M_MAIN, 56.46, 57.54),
+        "STEP_FORWARD":        (M_MAIN, 59.12, 60.26),
+        "LOOK_AHEAD":          (M_MAIN, 61.86, 63.22),
+        "MEASURE_AGAIN":       (M_MAIN, 64.74, 66.26),
+        # no male recordings yet for PERFECT / THREE_PICTURES / ONE / TWO /
+        # LEVEL_SHOULDERS / STRAIGHTEN_KNEES -> the stand-ins below are used
+    },
+}
+# If a clip has no recording in the chosen voice, say this one instead
+CLIP_STAND_INS = {
+    "PERFECT": "HOLD_STILL",
+    "THREE_PICTURES": "MEASURING_START",
+    "LEVEL_SHOULDERS": "STAND_STRAIGHT",
+    "STRAIGHTEN_KNEES": "STAND_STRAIGHT",
+}
+NON_BLOCKING_CLIPS = {"ONE", "TWO"}
+# Said after each picture (picture 3 gets "Success! Now move on to Station 2.")
+VOICE_AFTER_PICTURE = {1: "ONE", 2: "TWO"}
+
+# What is said for each on-screen banner
+VOICE_FOR_BANNER = {
+    # ONE clip per correction (was "step back" + "stand on the footprints").
+    # Head/feet out of view can mean too close OR off to the side, so the
+    # footprints clip fits every case.
+    "STEP BACK ONTO THE FOOTPRINTS": ["STAND_ON_FOOTPRINTS"],
+    "STEP BACK":                     ["STEP_BACK"],
+    "STEP FORWARD":                  ["STEP_FORWARD"],
+    "FACE THE CAMERA":               ["STAND_ON_FOOTPRINTS"],  # "...stand on the footprints and face the camera"
+}
+# Welcome = only what the camera CAN'T check (shoes, hat).
+# "Stand on the footprints" is added only while the spot isn't set with L;
+# once it is, it is said only to patients who are actually off the footprints.
+GREETING = ["WELCOME", "REMOVE_SHOES", "REMOVE_HAT"]
+# Only EXPLAIN what happens next. Corrections ("look straight ahead", "hold still",
+# "stand up straight", "level your shoulders"...) are said ONLY if the patient
+# isn't already doing it - see the VOICE PROMPTS section in the main loop.
+MEASURING_START = ["THREE_PICTURES"]   # "We will take three pictures." (says it all;
+                                       # add "MEASURING_START" in front to bring back
+                                       # "Now we will take your measurements.")
+BANNER_HOLD_SEC = 2.0            # a banner must stay this long before it is spoken
+                                 # (gives people time to settle onto the footprints by themselves)
+REPEAT_SEC = 12.0                # repeat a correction if it is still needed after this
+HOLD_STILL_REPEAT_SEC = 6.0      # "Please hold still" at most this often
+MAX_REMEASURES = 1               # times "measure again" may restart the 3 captures
+NEW_PATIENT_SEC = 5.0            # nobody in view this long -> next person gets the welcome again
+
+
+class VoicePrompts:
+    """Plays the recorded prompts one after another without freezing the video."""
+
+    def __init__(self):
+        self.sounds = {}
+        self.queue = deque()
+        self.channel = None
+        self.current = None      # clip playing now (NEW)
+        if not VOICE_ON or pygame is None:
+            print("Voice prompts off (pygame not installed or VOICE_ON = False).")
+            return
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=1)
+            freq, fmt, chans = pygame.mixer.get_init()
+            frame_bytes = abs(fmt) // 8 * chans
+            loaded = {}                  # audio file -> raw samples (each file read once)
+            for name, (file_name, start, end) in VOICES[VOICE].items():
+                if file_name not in loaded:
+                    path = HERE / file_name
+                    if path.exists():
+                        loaded[file_name] = pygame.mixer.Sound(str(path)).get_raw()
+                    else:
+                        loaded[file_name] = None
+                        print(f"Voice: {file_name} not found next to this program.")
+                raw = loaded[file_name]
+                if raw is None:
+                    continue
+                a = int(max(0.0, start - 0.05) * freq) * frame_bytes
+                b = min(len(raw), int((end + 0.12) * freq) * frame_bytes)
+                self.sounds[name] = pygame.mixer.Sound(buffer=raw[a:b])
+            # clips without a recording in this voice use a stand-in
+            for name, stand_in in CLIP_STAND_INS.items():
+                if name not in self.sounds and stand_in in self.sounds:
+                    self.sounds[name] = self.sounds[stand_in]
+            print(f"Voice prompts ready: {len(self.sounds)} clips ({VOICE}).")
+        except Exception as error:
+            print(f"Voice prompts off ({error}).")
+            self.sounds = {}
+
+    def say(self, *names):
+        for name in names:
+            if name in self.sounds:
+                self.queue.append(name)
+
+    def say_next(self, *names):
+        """Say these right after the clip that is playing now (before the rest of the queue)."""
+        for name in reversed(names):
+            if name in self.sounds and name not in self.queue:
+                self.queue.appendleft(name)
+
+    def stop(self):
+        self.queue.clear()
+        if self.channel is not None:
+            self.channel.stop()
+
+    @property
+    def playing(self):
+        return self.channel is not None and self.channel.get_busy()
+
+    @property
+    def busy(self):
+        # "One"/"Two" don't count as busy, so they never pause the measurement (NEW)
+        if any(name not in NON_BLOCKING_CLIPS for name in self.queue):
+            return True
+        return self.playing and self.current not in NON_BLOCKING_CLIPS
+
+    def update(self):
+        if self.queue and not self.playing:
+            name = self.queue.popleft()
+            print(f"  [voice] {name}")
+            self.current = name
+            self.channel = self.sounds[name].play()
+
+# ============================================
+# INITIALIZE MEDIAPIPE
+# ============================================
+
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=MODEL_COMPLEXITY,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+    enable_segmentation=True,      # person outline, used to find the real top of head
+    smooth_segmentation=True
+)
+
+
+
+def format_height(height_cm):
+    """Return the height as (imperial text, metric text)."""
+    total_inches = height_cm / 2.54
+    feet = int(total_inches // 12)
+    inches = total_inches - feet * 12
+    if inches >= 11.95:          # avoid showing "4 ft 12.0 in"
+        feet += 1
+        inches = 0.0
+    imperial = f"{feet} ft {inches:.1f} in"
+    metric = f"{height_cm:.1f} cm ({height_cm / 100:.2f} m)"
+    return imperial, metric
+
+
+def forward_distance(measured_cm, side_cm, up_down_cm):
+    """Straight-ahead distance along the floor (what the math needs).
+    If the tape went diagonally from the lens, remove the sideways and
+    up/down parts of that line."""
+    if not DISTANCES_MEASURED_DIAGONALLY:
+        return measured_cm
+    flat_sq = measured_cm ** 2 - side_cm ** 2 - up_down_cm ** 2
+    if flat_sq <= 0:
+        print("WARNING: side/height offsets are larger than the measured distance - check them.")
+        return measured_cm
+    return math.sqrt(flat_sq)
+
+
+def build_height_correction():
+    """Returns (correct(raw_cm) -> cm, description) from KNOWN_HEIGHTS."""
+    pts = [(float(t), float(r)) for t, r in KNOWN_HEIGHTS]
+    if not pts:
+        return (lambda raw: raw * CALIBRATION_FACTOR + HEIGHT_OFFSET_CM,
+                "factor/offset (KNOWN_HEIGHTS is empty)")
+    trues = np.array([p[0] for p in pts])
+    raws = np.array([p[1] for p in pts])
+    if len(pts) == 1 or raws.max() - raws.min() < 5.0:
+        off = float(np.mean(trues - raws))
+        return (lambda raw: raw + off,
+                f"offset {off:+.1f} cm from {len(pts)} known height(s)")
+    deg = 2 if len(pts) >= 4 else 1
+    poly = np.poly1d(np.polyfit(raws, trues, deg))
+    slope = poly.deriv()
+    lo, hi = float(raws.min()), float(raws.max())
+
+    def correct(raw):
+        # Outside the tested range keep going in a straight line,
+        # so the curve can't run away for very short/tall patients
+        if raw < lo:
+            return float(poly(lo) + slope(lo) * (raw - lo))
+        if raw > hi:
+            return float(poly(hi) + slope(hi) * (raw - hi))
+        return float(poly(raw))
+
+    kind = "straight-line" if deg == 1 else "curved"
+    for t, r in pts:
+        print(f"  known height {t:.1f} cm: raw {r:.1f} -> corrected {correct(r):.1f} "
+              f"(left over {correct(r) - t:+.1f} cm)")
+    return correct, f"{kind} fit from {len(pts)} known heights"
+
+
+def find_head_top(mask, x_center, half_width, start_y):
+    """Scan UP from start_y (nose) inside a narrow column until the
+    person outline ends. Returns the y of the top of the head/hair
+    (with sub-pixel precision), or None if the mask is unavailable."""
+    if mask is None or start_y <= 0:
+        return None
+    mh, mw = mask.shape[:2]
+    start_y = min(start_y, mh)
+    x0 = max(0, x_center - half_width)
+    x1 = min(mw, x_center + half_width)
+    if x1 <= x0:
+        return None
+    width = x1 - x0
+    # Fraction of the column covered by the person, row by row
+    cover = (mask[:start_y, x0:x1] > MASK_THRESHOLD).mean(axis=1)
+    min_cover = max(3.0 / width, HEAD_TOP_COVER)
+    gaps = np.where(cover < min_cover)[0]
+    if len(gaps) == 0:
+        return 0.0
+    r = int(gaps[-1])                  # last row above the head (outside the person)
+    if r + 1 >= start_y:
+        return float(start_y)
+    # Sub-pixel: where between row r and r+1 the coverage crosses the limit.
+    # Each pixel is ~0.3 cm at the patient, so this steadies the reading.
+    a, b = cover[r], cover[r + 1]
+    frac = (min_cover - a) / (b - a) if b > a else 1.0
+    return r + float(np.clip(frac, 0.0, 1.0))
+
+
+def find_feet_bottom(mask, x0, x1, start_y):
+    """Scan DOWN from start_y (ankles) until the person outline ends.
+    Returns the y where the feet touch the floor (display only)."""
+    if mask is None:
+        return None
+    mh, mw = mask.shape[:2]
+    x0 = max(0, x0)
+    x1 = min(mw, x1)
+    if x1 <= x0 or start_y >= mh:
+        return None
+    counts = (mask[start_y:, x0:x1] > MASK_THRESHOLD).sum(axis=1)
+    min_px = max(3, int((x1 - x0) * 0.05))
+    gaps = np.where(counts < min_px)[0]
+    return int(start_y + gaps[0] - 1) if len(gaps) else mh - 1
+
+
+BANNER_SIZE = 0.6        # text size of the bottom banner (bigger number = bigger text)
+BANNER_OPACITY = 0.45    # 0 = see-through, 1 = solid black (so the feet stay visible)
+
+
+def draw_banner(frame, text, color):
+    """Instruction banner along the bottom of the screen for the patient
+    (thin and see-through, so the feet stay visible)."""
+    h, w = frame.shape[:2]
+    scale = max(0.5, w / 900 * BANNER_SIZE)
+    thickness = max(1, int(scale * 2))
+    lines = text.split("\n")
+    line_h = int(36 * scale)
+    top = h - line_h * len(lines) - 14
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, top - 6), (w, h), (25, 25, 25), -1)
+    cv2.addWeighted(overlay, BANNER_OPACITY, frame, 1 - BANNER_OPACITY, 0, dst=frame)
+    for i, line in enumerate(lines):
+        (tw, _), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        x = max(10, (w - tw) // 2)
+        y = top + line_h * (i + 1) - 10
+        cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness)
+
+
+def draw_center_text(frame, lines, color, size=1.0):
+    """Big outlined text in the middle of the screen (countdown / picture taken)."""
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_DUPLEX
+    base = w / 450
+    total_h = 0
+    sized = []
+    for i, line in enumerate(lines):
+        scale = max(0.6, base * (size * 3.0 if i == 0 else max(size, 0.8)))
+        thick = max(2, int(scale * 2.5))
+        (tw, th), _ = cv2.getTextSize(line, font, scale, thick)
+        sized.append((line, scale, thick, tw, th))
+        total_h += th + int(20 * base)
+    y = (h - total_h) // 2
+    for line, scale, thick, tw, th in sized:
+        y += th
+        x = (w - tw) // 2
+        cv2.putText(frame, line, (x, y), font, scale, (0, 0, 0), thick + 6)   # outline
+        cv2.putText(frame, line, (x, y), font, scale, color, thick)
+        y += int(20 * base)
+
+
+def point_distance_cm(row, cy, focal_px, tilt, drop_cm):
+    """Horizontal distance (cm) from the camera to a point seen at this image
+    row that sits drop_cm below the camera lens. Used only for the
+    standing-line check (not for the height). Uses the LIVE tilt."""
+    angle_down = tilt + np.arctan((row - cy) / focal_px)
+    if angle_down <= np.radians(1.0):      # at/above the horizon: not usable
+        return None
+    return drop_cm / np.tan(angle_down)
+
+
+def save_screenshot(frame, name):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = SAVE_FOLDER / f"{name}_{timestamp}.png"
+    return filename if cv2.imwrite(str(filename), frame) else None
+
+from statistics import median
+
+# ============================================
+# POSTURE CHECK (NEW) - Sanat's posture_check.py (knee check turned off, see KNEE_CHECK_ON)
+# ============================================
+# SETTINGS
+# One knob for everything: 1.0 = normal, >1 = more forgiving, <1 = stricter
+LENIENCY = 1.0
+
+# Base limits (multiplied by LENIENCY)
+SHOULDER_TILT_MAX_DEG = 6.0     # shoulders more tilted than this = flag
+HEAD_TILT_MAX_DEG = 10.0        # head rolled more than this = flag
+TORSO_LEAN_MAX_DEG = 12.0       # torso leaning toward/away from camera
+HEAD_FORWARD_MAX_CM = 10.0      # head in front of / behind shoulders
+KNEE_MIN_DEG = 155.0            # knee angle below this = bent knees
+KNEE_CHECK_ON = False           # off: a front camera can't see knee bend
+                                # reliably, and baggy pants hide the knee, so it
+                                # kept asking patients to "straighten" straight knees
+                                # (for the knee limit, higher LENIENCY lowers it)
+
+MIN_VISIBILITY = 0.5            # landmark confidence needed (0-1)
+SMOOTH_FRAMES = 15              # frames averaged (median) for each number
+BAD_FRAMES_TO_FLAG = 15         # must be bad this many frames in a row to flag
+GOOD_FRAMES_TO_CLEAR = 8        # must be good this many frames to un-flag
+
+# MediaPipe Pose landmark numbers
+NOSE = 0
+L_EAR, R_EAR = 7, 8
+L_SH, R_SH = 11, 12
+L_HIP, R_HIP = 23, 24
+L_KNEE, R_KNEE = 25, 26
+L_ANK, R_ANK = 27, 28
+
+REQUIRED = [NOSE, L_EAR, R_EAR, L_SH, R_SH, L_HIP, R_HIP]
+if KNEE_CHECK_ON:
+    # knees/ankles only needed for the knee check; with it off, hidden knees
+    # (baggy pants, long skirts) no longer switch off the other posture checks
+    REQUIRED += [L_KNEE, R_KNEE, L_ANK, R_ANK]
+
+METRICS = ["shoulder_tilt", "head_tilt", "torso_lean", "head_forward", "knee_bend"]
+
+
+def _limits():
+    """Limits after applying LENIENCY."""
+    return {
+        "shoulder_tilt": SHOULDER_TILT_MAX_DEG * LENIENCY,
+        "head_tilt": HEAD_TILT_MAX_DEG * LENIENCY,
+        "torso_lean": TORSO_LEAN_MAX_DEG * LENIENCY,
+        "head_forward": HEAD_FORWARD_MAX_CM * LENIENCY,
+        "knee_bend": 180.0 - (180.0 - KNEE_MIN_DEG) * LENIENCY,
+    }
+
+
+def _tilt_deg(p1, p2, w, h):
+    """Angle (degrees) of the line p1->p2 away from horizontal, in pixels.
+    0 = perfectly level. Result is between -90 and 90."""
+    dx = (p2.x - p1.x) * w
+    dy = (p2.y - p1.y) * h
+    ang = math.degrees(math.atan2(dy, dx))
+    if ang > 90:
+        ang -= 180
+    elif ang < -90:
+        ang += 180
+    return ang
+
+
+def _mid(a, b):
+    return ((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2)
+
+
+def _angle_3d(a, b, c):
+    """Angle at point b (degrees) between segments b->a and b->c."""
+    v1 = (a.x - b.x, a.y - b.y, a.z - b.z)
+    v2 = (c.x - b.x, c.y - b.y, c.z - b.z)
+    n1 = math.sqrt(sum(t * t for t in v1))
+    n2 = math.sqrt(sum(t * t for t in v2))
+    if n1 == 0 or n2 == 0:
+        return 180.0
+    cosang = sum(p * q for p, q in zip(v1, v2)) / (n1 * n2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
+
+
+class PostureChecker:
+    """Call update(results, w, h) once per frame with the MediaPipe results."""
+
+    def __init__(self):
+        self.history = {m: deque(maxlen=SMOOTH_FRAMES) for m in METRICS}
+        # Optional reference (P key). 0 = use absolute limits (default).
+        self.baseline = {"torso_lean": 0.0, "head_forward": 0.0}
+        self.baseline_set = False
+        self.bad_count = 0
+        self.good_count = 0
+        self.flagged = False
+
+    # ---------- measuring ----------
+    def _measure(self, results, w, h):
+        """Return one frame's raw numbers, or None if the body isn't clear."""
+        if not results.pose_landmarks or not results.pose_world_landmarks:
+            return None
+        lm = results.pose_landmarks.landmark
+        wl = results.pose_world_landmarks.landmark
+
+        if any(lm[i].visibility < MIN_VISIBILITY for i in REQUIRED):
+            return None
+
+        shoulder_tilt = abs(_tilt_deg(lm[L_SH], lm[R_SH], w, h))
+        head_tilt = abs(_tilt_deg(lm[L_EAR], lm[R_EAR], w, h))
+
+        sh = _mid(wl[L_SH], wl[R_SH])
+        hip = _mid(wl[L_HIP], wl[R_HIP])
+        ear = _mid(wl[L_EAR], wl[R_EAR])
+
+        # Lean of the torso toward/away from the camera (signed degrees)
+        torso_lean = math.degrees(math.atan2(sh[2] - hip[2], abs(sh[1] - hip[1])))
+
+        # Head in front of / behind the shoulders (signed cm, camera axis)
+        head_forward = (ear[2] - sh[2]) * 100.0
+
+        # Smallest knee angle (180 = straight)
+        if KNEE_CHECK_ON:
+            knee_bend = min(
+                _angle_3d(wl[L_HIP], wl[L_KNEE], wl[L_ANK]),
+                _angle_3d(wl[R_HIP], wl[R_KNEE], wl[R_ANK]),
+            )
+        else:
+            knee_bend = 180.0           # not checked: treat as straight
+
+        return {
+            "shoulder_tilt": shoulder_tilt,
+            "head_tilt": head_tilt,
+            "torso_lean": torso_lean,
+            "head_forward": head_forward,
+            "knee_bend": knee_bend,
+        }
+
+    def _smoothed(self):
+        return {m: median(self.history[m]) for m in METRICS if self.history[m]}
+
+    # ---------- public ----------
+    def set_baseline(self):
+        """OPTIONAL: record the current posture as the reference for the two
+        forward/back numbers. Not needed for normal use."""
+        s = self._smoothed()
+        if len(self.history["torso_lean"]) < SMOOTH_FRAMES // 2 or not s:
+            return False
+        self.baseline["torso_lean"] = s["torso_lean"]
+        self.baseline["head_forward"] = s["head_forward"]
+        self.baseline_set = True
+        return True
+
+    def update(self, results, w, h):
+        """
+        Returns a dict:
+          status  : "ok", "bad" (flag it), or "unknown" (body not clearly visible)
+          issues  : list of short messages for the person
+          metrics : the smoothed numbers (plus torso_dev / head_dev)
+          limits  : the limits currently in use
+        """
+        lim = _limits()
+        raw = self._measure(results, w, h)
+
+        if raw is None:
+            for m in METRICS:
+                self.history[m].clear()
+            self.bad_count = self.good_count = 0
+            self.flagged = False
+            return {"status": "unknown", "issues": [], "metrics": {}, "limits": lim}
+
+        for m in METRICS:
+            self.history[m].append(raw[m])
+
+        # Wait until the averaging window is mostly full, so a single
+        # noisy first frame can't trigger a flag
+        if len(self.history["torso_lean"]) < SMOOTH_FRAMES // 2:
+            return {"status": "ok", "issues": [], "metrics": self._smoothed(),
+                    "limits": lim}
+
+        s = self._smoothed()
+        torso_dev = s["torso_lean"] - self.baseline["torso_lean"]
+        head_dev = s["head_forward"] - self.baseline["head_forward"]
+
+        issues = []
+        if abs(torso_dev) > lim["torso_lean"] or abs(head_dev) > lim["head_forward"]:
+            issues.append("Stand up straight - don't slouch")
+        if s["shoulder_tilt"] > lim["shoulder_tilt"]:
+            issues.append("Level your shoulders")
+        if s["head_tilt"] > lim["head_tilt"]:
+            issues.append("Keep your head straight")
+        if KNEE_CHECK_ON and s["knee_bend"] < lim["knee_bend"]:
+            issues.append("Straighten your knees")
+
+        # Hysteresis: flag after many bad frames, clear after several good ones
+        if issues:
+            self.bad_count += 1
+            self.good_count = 0
+            if self.bad_count >= BAD_FRAMES_TO_FLAG:
+                self.flagged = True
+        else:
+            self.good_count += 1
+            self.bad_count = 0
+            if self.good_count >= GOOD_FRAMES_TO_CLEAR:
+                self.flagged = False
+
+        metrics = dict(s)
+        metrics["torso_dev"] = torso_dev
+        metrics["head_dev"] = head_dev
+        return {
+            "status": "bad" if self.flagged else "ok",
+            "issues": issues if self.flagged else [],
+            "metrics": metrics,
+            "limits": lim,
+        }
+
+
+
+# How posture is used here (NEW)
+POSTURE_CHECK_ON = True          # False = ignore posture completely
+POSTURE_GIVE_UP_SEC = 15.0       # bad posture this long -> measure anyway (natural hunch,
+                                 # loose pants, etc.) so the patient isn't stuck forever
+# Extra front-view checks (NEW): only need shoulders + hips, so they still work when
+# an ear or ankle is hidden (Sanat's checker then reports "unknown")
+SIDE_LEAN_MAX_DEG = 8.0          # body leaning to one side (shoulders vs hips, 2D)
+# FACE THE CAMERA (NEW): only measure when the patient faces the camera.
+# Shoulder width / torso length is ~0.7-0.9 facing the camera and ~0.2-0.4
+# turned sideways. Measuring sideways or bent over reads wrong.
+FACING_MIN_RATIO = 0.5
+FACING_FRAMES = 8                # frames in a row to flag / clear
+POSTURE_2D_FRAMES = 8            # frames in a row to flag / clear these checks
+# When several problems show at once, say the most reliable one first
+# (the front camera sees tilts directly; slouching comes from a depth guess)
+POSTURE_ISSUE_ORDER = ["Level your shoulders", "Stand up straight - don't lean",
+                       "Keep your head straight", "Straighten your knees",
+                       "Stand up straight - don't slouch"]
+# What is said for each posture message (missing clips fall back to STAND_STRAIGHT)
+VOICE_FOR_POSTURE = {
+    "Stand up straight - don't slouch": ["STAND_STRAIGHT"],   # existing clip
+    "Stand up straight - don't lean":   ["STAND_STRAIGHT"],   # existing clip
+    "Level your shoulders":             ["LEVEL_SHOULDERS"],
+    "Keep your head straight":          ["LOOK_AHEAD"],       # existing clip
+    "Straighten your knees":            ["STRAIGHTEN_KNEES"],
+}
+
+# ============================================
+# INITIALIZE APRILTAG DETECTOR
+# ============================================
+
+aruco = getattr(cv2, "aruco", None)
+
+if aruco is not None:
+    dictionary = aruco.getPredefinedDictionary(
+        aruco.DICT_APRILTAG_36h11
+    )
+
+    parameters = aruco.DetectorParameters()
+    # Tuned for small / far / slightly blurry tags (Orbbec)
+    for _name, _value in (
+        ("adaptiveThreshWinSizeMin", 3),
+        ("adaptiveThreshWinSizeMax", 53),   # bigger windows help with uneven light
+        ("adaptiveThreshWinSizeStep", 4),
+        ("minMarkerPerimeterRate", 0.01),   # allow small tags (far away)
+        ("polygonalApproxAccuracyRate", 0.05),
+        ("minCornerDistanceRate", 0.02),
+        ("minDistanceToBorder", 1),
+        ("perspectiveRemovePixelPerCell", 8),
+        ("perspectiveRemoveIgnoredMarginPerCell", 0.15),
+        ("cornerRefinementWinSize", 5),
+        ("cornerRefinementMaxIterations", 50),
+        ("cornerRefinementMinAccuracy", 0.01),
+    ):
+        try:
+            setattr(parameters, _name, _value)
+        except Exception:
+            pass
+    try:
+        # sub-pixel corners: steadier tilt/zoom readings
+        parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    except Exception:
+        pass
+    detector = aruco.ArucoDetector(
+        dictionary, parameters
+    )
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    detector_plain = aruco.ArucoDetector(dictionary, aruco.DetectorParameters())
+    last_tag_box = {}            # tag id -> (center x, center y, size px) last seen
+
+    print("AprilTag detection enabled.")
+else:
+    detector = None
+    print("AprilTag unavailable. Pixel tracking only.")
+
+# ============================================
+# OPEN CAMERA
+# ============================================
+
+cap = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_AVFOUNDATION
+)
+
+if not cap.isOpened():
+    print("ERROR: Camera could not be opened.")
+    pose.close()
+    raise SystemExit
+
+
+use_custom_size = bool(PICTURE_WIDTH_PX and PICTURE_HEIGHT_PX)
+
+
+def configure_camera(c):
+    """Only changes the picture size if asked to (otherwise: original connection)."""
+    if use_custom_size:
+        c.set(cv2.CAP_PROP_FRAME_WIDTH, PICTURE_WIDTH_PX)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, PICTURE_HEIGHT_PX)
+
+
+def first_picture(c, tries=30):
+    for _ in range(tries):
+        ok, img = c.read()
+        if ok:
+            return img
+        time.sleep(0.1)
+    return None
+
+
+configure_camera(cap)
+_test = first_picture(cap)
+if _test is None and use_custom_size:
+    # the camera didn't like that size: go back to the original connection
+    print(f"Camera gave no picture at {PICTURE_WIDTH_PX} x {PICTURE_HEIGHT_PX} - "
+          "using the camera's default size instead.")
+    use_custom_size = False
+    cap.release()
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_AVFOUNDATION)
+    _test = first_picture(cap)
+_ok = _test is not None
+if _ok:
+    print(f"Camera picture: {_test.shape[1]} x {_test.shape[0]}")
+
+
+def detect_tags(gray_img):
+    """Find AprilTags. Returns (corners, ids) like detectMarkers.
+    1) standard search  2) tuned search on a contrast-boosted picture
+    3) zoomed search where a wanted tag was last seen, if still missed."""
+    wanted = {TAG_ID, *REF_TAGS}
+    result = {}
+
+    def add(found_c, found_i):
+        if found_i is not None:
+            for c, i in zip(found_c, found_i.flatten()):
+                if int(i) in wanted and int(i) not in result:
+                    result[int(i)] = c.reshape(4, 2).astype(np.float32)
+
+    # 1) standard search (best for sharp tags)
+    c1, i1, _ = detector_plain.detectMarkers(gray_img)
+    add(c1, i1)
+    img = clahe.apply(gray_img) if TAG_CONTRAST_BOOST else gray_img
+    # 2) tuned search on the contrast-boosted picture, only if something is missing
+    if wanted - set(result):
+        c2, i2, _ = detector.detectMarkers(img)
+        add(c2, i2)
+    if TAG_ZOOM_SEARCH:
+        ih, iw = img.shape[:2]
+        for tid in [TAG_ID] + list(REF_TAGS):
+            if tid in result or tid not in last_tag_box:
+                continue
+            cx, cy0, size = last_tag_box[tid]
+            half = int(max(40, size * 2.5))
+            x0, y0 = max(0, int(cx - half)), max(0, int(cy0 - half))
+            x1, y1 = min(iw, int(cx + half)), min(ih, int(cy0 + half))
+            if x1 - x0 < 20 or y1 - y0 < 20:
+                continue
+            crop = cv2.resize(img[y0:y1, x0:x1], None, fx=2.0, fy=2.0,
+                              interpolation=cv2.INTER_CUBIC)
+            zc, zi, _ = detector.detectMarkers(crop)
+            if zi is None:
+                continue
+            for c, i in zip(zc, zi.flatten()):
+                if int(i) == tid:
+                    pts = c.reshape(4, 2) / 2.0 + np.array([x0, y0], np.float32)
+                    result[tid] = pts.astype(np.float32)
+    for tid, pts in result.items():
+        last_tag_box[tid] = (float(pts[:, 0].mean()), float(pts[:, 1].mean()),
+                             float(np.linalg.norm(pts[1] - pts[0])))
+    if not result:
+        return (), None
+    ids_sorted = sorted(result)
+    return ([result[t].reshape(1, 4, 2) for t in ids_sorted],
+            np.array(ids_sorted, dtype=np.int32).reshape(-1, 1))
+
+print("PREV-HUB HEIGHT TRACKER STARTED")
+print("Keep the AprilTag in view: the tilt is measured live from it.")
+print("Keys (click the camera window first):")
+print("  L = teach standing spot (stand on the footprints, press L; repeat with a")
+print("      much taller or shorter person)   K = forget taught spots")
+print("  S = manual screenshot   C = recalibrate   Q = quit")
+print("  F = full screen on/off   H = hide/show the staff panel")
+print("  P = (optional) use the current posture as the posture reference")
+print("  NOTE: 'Please step back / step forward' starts after the spot is set with L.")
+
+# Resizable window (rotated image is tall)
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+_pic = _test if _ok else None
+if _pic is not None:
+    _ph, _pw = _pic.shape[:2]
+    if ROTATE in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        _ph, _pw = _pw, _ph
+    cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, int(WINDOW_WIDTH * _ph / _pw))
+fullscreen = START_FULLSCREEN
+if fullscreen:
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+show_panel = SHOW_STAFF_PANEL
+
+# ============================================
+# TRACKING VARIABLES
+# ============================================
+
+focal_history = deque(maxlen=CALIBRATION_FRAMES)
+tilt_history = deque(maxlen=CALIBRATION_FRAMES)
+height_history = deque(maxlen=STABLE_FRAMES)
+
+# Everything below works in centimeters (angles in radians)
+cam_h_cm = CAMERA_HEIGHT_CM
+tilt_rad = np.radians(CAMERA_TILT_DEG)
+tag_h_cm = TAG_CENTER_HEIGHT_CM
+# Straight-ahead distances (NEW: corrected if taped diagonally)
+patient_dist_cm = forward_distance(PATIENT_DISTANCE_CM, PATIENT_SIDE_OFFSET_CM, cam_h_cm)
+tag_dist_cm = forward_distance(TAG_DISTANCE_CM, TAG_SIDE_OFFSET_CM, cam_h_cm - tag_h_cm)
+if DISTANCES_MEASURED_DIAGONALLY:
+    print(f"Straight-ahead distances: patient {patient_dist_cm:.1f} cm, tag {tag_dist_cm:.1f} cm")
+
+# Height correction from people of known height (NEW)
+correct_height, correction_text = build_height_correction()
+print(f"Height correction: {correction_text}")
+
+# Log of every final result, for filling in KNOWN_HEIGHTS (NEW)
+LOG_FILE = SAVE_FOLDER / "height_log.csv"
+if not LOG_FILE.exists():
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.writer(f).writerow(["time", "final_cm", "final_ft_in", "raw_cm",
+                                "captures_cm", "spread_cm", "feet_offset_cm",
+                                "head_distance_cm", "correction"])
+
+present_count = 0        # frames the current patient has been in view
+missing_count = RESET_FRAMES
+captures = []            # measurements for the current patient (cm)
+final_height_cm = None   # result once all captures are done
+final_saved = False      # final screenshot already written for this patient
+ever_calibrated = False  # True once the first MIN_CALIBRATION_FRAMES readings are in
+
+ankle_row_history = deque(maxlen=15)  # recent FEET rows (floor contact), for teaching the spot
+# Taught standing spots (NEW): one (body height cm, foot-center distance cm)
+# per person who pressed L. Two people of different heights -> the spot
+# follows body size.
+spot_points = []
+recent_heights = deque(maxlen=15)     # body height (fixed distance), for the spot lookup
+skull_history = deque(maxlen=15)      # face-based skull-top estimates (cm), hair check
+outline_cm = skull_cm = None
+hair_cut = False
+offset_history = deque(maxlen=15)     # feet offset, for the patient's real distance
+raw_history = deque(maxlen=STABLE_FRAMES)  # uncorrected heights, for the log
+captures_raw = []
+head_dist_used = patient_dist_cm
+
+
+def foot_center_cm(toe_dist_cm, body_h_cm):
+    """Distance to the middle of the feet: the camera sees the toes,
+    the middle is half a foot length further away."""
+    return toe_dist_cm + 0.5 * FOOT_LENGTH_RATIO * body_h_cm
+
+
+ref_rows = {tid: deque(maxlen=REF_HISTORY) for tid in REF_TAGS}
+ref_widths = {tid: deque(maxlen=REF_HISTORY) for tid in REF_TAGS}   # px, horizontal edges
+ref_dist_cm = float(RULER_TAG_DISTANCE_CM)
+ruler = None                     # (a, b): height = a + b * tan(angle down)
+ruler_tags = 0
+if REF_TAGS:
+    print(f"Ruler tags: {sorted(REF_TAGS)} at {ref_dist_cm:.1f} cm - keep them in view.")
+
+
+def ruler_fit(focal, tilt, center_y):
+    """Fit height = a + b * tan(angle down) through the ruler tags.
+    Returns ((a, b), number of tags used) or (None, 0)."""
+    pts = []
+    for tid, rows in ref_rows.items():
+        if len(rows) >= 5:
+            t = np.tan(tilt + np.arctan((np.median(rows) - center_y) / focal))
+            pts.append((t, REF_TAGS[tid]))
+    if not pts:
+        return None, 0
+    ts = np.array([p[0] for p in pts])
+    hs = np.array([p[1] for p in pts])
+    if len(pts) == 1 or ts.max() - ts.min() < 1e-3:
+        # one tag: it fixes the height level, the booth distance gives the scale
+        b = -ref_dist_cm
+        a = float(np.mean(hs - b * ts))
+        return (a, b), len(pts)
+    b, a = np.polyfit(ts, hs, 1)
+    return (float(a), float(b)), len(pts)
+
+
+def ruler_tag_distance_cm(focal, tilt):
+    """How far away the ruler tags really are (from their printed size),
+    straight ahead along the floor. Used only as a placement check."""
+    dists = []
+    for tid, widths in ref_widths.items():
+        if len(widths) >= 5:
+            depth = focal * RULER_TAG_WIDTH_CM / float(np.median(widths))
+            drop = cam_h_cm - REF_TAGS[tid]
+            dists.append((depth - drop * np.sin(tilt)) / np.cos(tilt))
+    return float(np.median(dists)) if dists else None
+
+
+def height_at(angle_down, dist_cm):
+    """Height (cm) of the line of sight at this distance from the camera."""
+    t = np.tan(angle_down)
+    if ruler is None:
+        return cam_h_cm - dist_cm * t
+    a, b = ruler
+    # the ruler is at ref_dist_cm; scale for a patient a little nearer/farther
+    return a + b * t * (dist_cm / ref_dist_cm)
+
+
+def expected_spot_cm(body_h_cm):
+    """Where the middle of the feet should be for someone this tall."""
+    hs = np.array([p[0] for p in spot_points])
+    cs = np.array([p[1] for p in spot_points])
+    if len(spot_points) == 1 or hs.max() - hs.min() < SPOT_MIN_HEIGHT_GAP_CM:
+        return float(np.median(cs))
+    slope, intercept = np.polyfit(hs, cs, 1)
+    # don't extrapolate wildly past the people who taught it
+    body_h_cm = float(np.clip(body_h_cm, hs.min() - 25, hs.max() + 25))
+    return float(slope * body_h_cm + intercept)
+
+# Voice prompts (NEW)
+voice = VoicePrompts()
+
+# Posture check (NEW)
+posture = PostureChecker()
+posture_state = {"status": "unknown", "issues": [], "metrics": {}, "limits": {}}
+posture_bad_since = None         # when the current bad-posture stretch started
+posture_issue = ""               # message for the patient (kept while the flag clears)
+extra_bad_count = extra_good_count = 0
+extra_flag = False               # extra front-view check flagged
+extra_issues = []
+not_facing = False               # patient turned sideways (NEW)
+facing_good = facing_bad = 0
+posture_corrected = False        # a posture prompt was given -> say "Perfect" once it's fixed
+greeted = False          # greeting already played for this patient
+measure_announced = False
+remeasures = 0
+banner_key = None        # banner currently on screen
+banner_since = 0.0
+last_seen_at = time.monotonic()  # last time a person was in view
+spoken_key = None        # last banner that was spoken
+spoken_at = 0.0
+hold_still_at = 0.0
+missed_frames = 0        # camera frames in a row that failed to arrive
+fps_est = 15.0           # measured camera/processing speed, used for the countdown (NEW)
+last_frame_at = time.monotonic()
+flash_text = None        # "PICTURE 1 OF 3 TAKEN" message (NEW)
+flash_until = 0.0
+
+# ============================================
+# MAIN CAMERA LOOP
+# ============================================
+
+try:
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            # The iPhone camera drops out now and then: wait and reconnect
+            # instead of quitting (gives up after about 30 s without a picture)
+            if missed_frames == 0:
+                print("Camera dropped out - waiting for it to come back...")
+            missed_frames += 1
+            if missed_frames % 20 == 0:          # every ~2 s, reopen the camera
+                cap.release()
+                cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_AVFOUNDATION)
+                configure_camera(cap)
+            if missed_frames > 300:
+                print("Could not read camera frame for 30 s - stopping.")
+                break
+            if cv2.waitKey(100) & 0xFF in (ord("q"), ord("Q")):
+                break
+            continue
+        if missed_frames:
+            print("Camera is back.")
+            missed_frames = 0
+
+        # Rotate vertically mounted camera upright
+        if ROTATE is not None:
+            frame = cv2.rotate(frame, ROTATE)
+
+        h, w = frame.shape[:2]
+        cy = h / 2.0
+
+        # Measure how many frames per second we really get, so the
+        # countdown shows real seconds (smoothed so it doesn't jump around)
+        _t = time.monotonic()
+        _dt = _t - last_frame_at
+        last_frame_at = _t
+        if 0 < _dt < 1.0:
+            fps_est = 0.9 * fps_est + 0.1 * (1.0 / _dt)
+
+        # ------------------------------------
+        # DETECT APRILTAG
+        # Must run on the UNMIRRORED frame: a mirrored
+        # AprilTag decodes as an invalid code, so
+        # detectMarkers() always returns None.
+        # ------------------------------------
+
+        tag_found = False
+        tag_pts = None
+        ref_draw = []
+
+        if detector is not None:
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            corners, ids = detect_tags(gray)
+
+            if ids is not None:
+
+                for i, marker_id in enumerate(ids.flatten()):
+
+                    # Ruler tags (NEW): only their center row is needed
+                    if int(marker_id) in ref_rows:
+                        rpts = corners[i].reshape(4, 2).copy()
+                        ref_rows[int(marker_id)].append(float(rpts[:, 1].mean()))
+                        redges = [rpts[(j + 1) % 4] - rpts[j] for j in range(4)]
+                        rh = [np.linalg.norm(e) for e in redges if abs(e[0]) >= abs(e[1])]
+                        if rh:
+                            ref_widths[int(marker_id)].append(float(np.mean(rh)))
+                        rpts[:, 0] = (w - 1) - rpts[:, 0]      # mirrored, for drawing
+                        ref_draw.append(rpts)
+                        continue
+
+                    if marker_id != TAG_ID or tag_found:
+                        continue
+
+                    pts = corners[i].reshape(4, 2).copy()
+
+                    # Use the two most HORIZONTAL edges: a downward tilt
+                    # shrinks the vertical edges but not the horizontal ones
+                    edges = [pts[(j + 1) % 4] - pts[j] for j in range(4)]
+                    horiz = [
+                        np.linalg.norm(e) for e in edges
+                        if abs(e[0]) >= abs(e[1])
+                    ]
+                    if len(horiz) == 0:
+                        horiz = [np.linalg.norm(e) for e in edges]
+                    tag_width_px = float(np.mean(horiz))
+
+                    if tag_width_px > 5:
+
+                        tag_center_y = float(pts[:, 1].mean())
+
+                        # Angle from the camera down to the tag center,
+                        # known from the measured booth geometry
+                        tag_drop_cm = cam_h_cm - tag_h_cm
+                        tag_angle = np.arctan(tag_drop_cm / tag_dist_cm)
+
+                        # Solve tilt and focal length together (they depend
+                        # on each other, so repeat until they settle)
+                        tilt_est = tilt_rad
+                        for _ in range(10):
+                            tag_z_cm = (
+                                tag_dist_cm * np.cos(tilt_est)
+                                + tag_drop_cm * np.sin(tilt_est)
+                            )
+                            # Focal length in pixels: tag width = f * width / depth.
+                            # Uses the HORIZONTAL edges, so it must use the
+                            # real left-right width of the printed tag.
+                            f_est = tag_width_px * tag_z_cm / TAG_WIDTH_CM
+
+                            if not AUTO_TILT:
+                                break
+
+                            # Tilt = (angle down to tag) - (tag's angle
+                            # below the image center)
+                            tilt_est = tag_angle - np.arctan(
+                                (tag_center_y - cy) / f_est
+                            )
+
+                        # Keep updating: the newest readings replace the oldest
+                        focal_history.append(f_est)
+                        tilt_history.append(tilt_est)
+
+                        # Camera clearly changed? Keep only the newest readings
+                        if len(tilt_history) >= 20:
+                            new_tilt = np.median(list(tilt_history)[-10:])
+                            new_focal = np.median(list(focal_history)[-10:])
+                            tilt_jump = abs(np.degrees(new_tilt - np.median(tilt_history)))
+                            focal_jump = abs(new_focal / np.median(focal_history) - 1) * 100
+                            if tilt_jump > CHANGE_TILT_DEG or focal_jump > CHANGE_FOCAL_PCT:
+                                keep_t = list(tilt_history)[-10:]
+                                keep_f = list(focal_history)[-10:]
+                                tilt_history.clear(); tilt_history.extend(keep_t)
+                                focal_history.clear(); focal_history.extend(keep_f)
+                                print(f"Camera change detected (tilt {tilt_jump:.2f} deg, "
+                                      f"zoom {focal_jump:.1f}%) - updated.")
+
+                        tag_found = True
+
+                        # Convert corners to mirrored-frame
+                        # coordinates for drawing
+                        pts[:, 0] = (w - 1) - pts[:, 0]
+                        tag_pts = pts
+
+        # Camera focal length (pixels) and tilt, from the most recent tag
+        # readings. Updated live whenever the tag is visible; if the tag is
+        # hidden, the last readings are kept.
+        focal_px = float(np.median(focal_history)) if focal_history else None
+        if len(focal_history) >= MIN_CALIBRATION_FRAMES:
+            ever_calibrated = True
+        calibrated = ever_calibrated and bool(focal_history)
+
+        # Camera tilt: measured from the tag (AUTO_TILT) or typed in
+        if AUTO_TILT and tilt_history:
+            tilt_used = float(np.median(tilt_history))
+        else:
+            tilt_used = tilt_rad
+
+        # Ruler from the reference tags (NEW)
+        if ref_rows and focal_px is not None:
+            ruler, ruler_tags = ruler_fit(focal_px, tilt_used, cy)
+
+        # Mirror webcam AFTER tag detection
+        # (display, MediaPipe and screenshots stay mirrored)
+        frame = cv2.flip(frame, 1)
+
+        if tag_pts is not None:
+            cv2.polylines(frame, [tag_pts.astype(np.int32)], True, (255, 0, 255), 2)
+        for rp in ref_draw:
+            cv2.polylines(frame, [rp.astype(np.int32)], True, (0, 255, 0), 2)
+
+        # ------------------------------------
+        # DETECT BODY
+        # ------------------------------------
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+
+        # ---- POSTURE (NEW, Sanat's checker) ----
+        posture_state = posture.update(results, w, h)
+
+        # Extra front-view checks (NEW): uneven shoulders and leaning to one side
+        frame_issues = []
+        if results.pose_landmarks:
+            plm = results.pose_landmarks.landmark
+            if min(plm[i].visibility for i in (L_SH, R_SH, L_HIP, R_HIP)) >= MIN_VISIBILITY:
+                if abs(_tilt_deg(plm[L_SH], plm[R_SH], w, h)) > SHOULDER_TILT_MAX_DEG * LENIENCY:
+                    frame_issues.append("Level your shoulders")
+                sx = (plm[L_SH].x + plm[R_SH].x) / 2 * w
+                sy = (plm[L_SH].y + plm[R_SH].y) / 2 * h
+                hx = (plm[L_HIP].x + plm[R_HIP].x) / 2 * w
+                hy = (plm[L_HIP].y + plm[R_HIP].y) / 2 * h
+                if math.degrees(math.atan2(abs(sx - hx), abs(hy - sy) + 1e-6)) > SIDE_LEAN_MAX_DEG * LENIENCY:
+                    frame_issues.append("Stand up straight - don't lean")
+        if frame_issues:
+            extra_bad_count += 1
+            extra_good_count = 0
+            extra_issues = frame_issues
+            if extra_bad_count >= POSTURE_2D_FRAMES:
+                extra_flag = True
+        else:
+            extra_good_count += 1
+            extra_bad_count = 0
+            if extra_good_count >= POSTURE_2D_FRAMES:
+                extra_flag = False
+
+        all_issues = (extra_issues if extra_flag else []) + posture_state["issues"]
+        posture_bad = POSTURE_CHECK_ON and (posture_state["status"] == "bad" or extra_flag)
+
+        # Facing the camera? (NEW) shoulder width vs torso length, in the picture
+        facing_now = True
+        if results.pose_landmarks:
+            flm = results.pose_landmarks.landmark
+            if min(flm[i].visibility for i in (L_SH, R_SH, L_HIP, R_HIP)) >= MIN_VISIBILITY * 0.6:
+                span = abs(flm[L_SH].x - flm[R_SH].x) * w
+                torso = abs((flm[L_SH].y + flm[R_SH].y) - (flm[L_HIP].y + flm[R_HIP].y)) / 2 * h
+                if torso > 1 and span / torso < FACING_MIN_RATIO:
+                    facing_now = False
+            # turned so far that a shoulder or hip disappears: also sideways
+            elif min(flm[L_SH].visibility, flm[R_SH].visibility) < 0.2:
+                facing_now = False
+        if facing_now:
+            facing_good += 1
+            facing_bad = 0
+            if facing_good >= FACING_FRAMES:
+                not_facing = False
+        else:
+            facing_bad += 1
+            facing_good = 0
+            if facing_bad >= FACING_FRAMES:
+                not_facing = True
+        for issue in POSTURE_ISSUE_ORDER:
+            if issue in all_issues:
+                posture_issue = issue
+                break
+        else:
+            if all_issues:
+                posture_issue = all_issues[0]
+            elif not posture_issue:
+                posture_issue = "Stand up straight - don't slouch"
+        if posture_bad:
+            if posture_bad_since is None:
+                posture_bad_since = time.monotonic()
+                print("  Posture: " + " | ".join(all_issues))
+            if time.monotonic() - posture_bad_since >= POSTURE_GIVE_UP_SEC:
+                posture_bad = False      # waited long enough: measure anyway
+        else:
+            posture_bad_since = None
+
+        person_seen = results.pose_landmarks is not None
+        full_body = False
+        height_now = None
+        height_raw = None
+        line_offset_cm = None    # + = behind the footprints, - = in front of them
+
+        if person_seen:
+
+            landmarks = results.pose_landmarks.landmark
+
+            mp_drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS
+            )
+
+            L = mp_pose.PoseLandmark
+            nose = landmarks[L.NOSE]
+            left_ear, right_ear = landmarks[L.LEFT_EAR], landmarks[L.RIGHT_EAR]
+            left_shoulder, right_shoulder = landmarks[L.LEFT_SHOULDER], landmarks[L.RIGHT_SHOULDER]
+            left_ankle, right_ankle = landmarks[L.LEFT_ANKLE], landmarks[L.RIGHT_ANKLE]
+            left_heel, right_heel = landmarks[L.LEFT_HEEL], landmarks[L.RIGHT_HEEL]
+            left_toe, right_toe = landmarks[L.LEFT_FOOT_INDEX], landmarks[L.RIGHT_FOOT_INDEX]
+            left_eye, right_eye = landmarks[L.LEFT_EYE], landmarks[L.RIGHT_EYE]
+            mouth_l, mouth_r = landmarks[L.MOUTH_LEFT], landmarks[L.MOUTH_RIGHT]
+
+            # The height math only uses the HEAD, so the feet only need to be
+            # roughly visible (to confirm the patient is standing in place).
+            upper_ok = all(
+                p.visibility > BODY_VISIBILITY
+                for p in (nose, left_shoulder, right_shoulder)
+            )
+            ankles_ok = all(
+                p.visibility > ANKLE_VISIBILITY
+                for p in (left_ankle, right_ankle)
+            )
+
+            if upper_ok and ankles_ok:
+
+                nose_y = int(nose.y * h)
+                ankle_y = int(max(left_ankle.y, right_ankle.y) * h)
+
+                # Head center = midpoint between the ears
+                center_x = int((left_ear.x + right_ear.x) / 2 * w)
+                ear_span = int(abs(left_ear.x - right_ear.x) * w)
+
+                mask = results.segmentation_mask
+
+                # ---- TOP OF HEAD from the person outline ----
+                head_top_y = find_head_top(
+                    mask, center_x, max(8, ear_span // 4), nose_y
+                )
+                if head_top_y is None:
+                    # Fallback estimate from the nose-to-ankle distance
+                    head_top_y = int(nose_y - (ankle_y - nose_y) * 0.15)
+
+                # ---- FEET (display only) ----
+                foot_xs = [
+                    p.x * w for p in
+                    (left_heel, right_heel, left_toe, right_toe,
+                     left_ankle, right_ankle)
+                ]
+                margin = max(10, ear_span // 2)
+                feet_y = find_feet_bottom(
+                    mask,
+                    int(min(foot_xs)) - margin,
+                    int(max(foot_xs)) + margin,
+                    ankle_y
+                )
+                if feet_y is None:
+                    feet_y = min(h - 1, int(max(left_heel.y, right_heel.y) * h))
+
+                # Head must be fully in the picture (not cut off at the top)
+                full_body = 10 < head_top_y < nose_y and 0 < center_x < w
+
+                if full_body:
+
+                    head_px = int(round(head_top_y))
+                    # Yellow line + red dots: head top and floor
+                    cv2.line(frame, (center_x, head_px), (center_x, feet_y), (0, 255, 255), 3)
+                    cv2.circle(frame, (center_x, head_px), 6, (0, 0, 255), -1)
+                    cv2.circle(frame, (center_x, min(feet_y, h - 4)), 6, (0, 0, 255), -1)
+
+                    # ---- STANDING LINE CHECK (feet) ----
+                    # Uses where the FEET touch the floor (the yellow line's bottom dot),
+                    # not the ankles: the floor is at the same height for everyone, while
+                    # ankle height changes with body size and shoes.
+                    # That bottom dot is the TOES; the check compares the MIDDLE of
+                    # the feet (NEW), so big and small feet are judged the same way.
+                    ankle_row = float(feet_y)
+                    ankle_drop_cm = cam_h_cm
+
+                    if ankle_row < h:
+                        ankle_row_history.append(ankle_row)
+                        # smooth out frame-to-frame flicker of the outline
+                        ankle_row = float(np.median(list(ankle_row_history)[-5:]))
+
+                    angle_down = None
+                    if focal_px is not None:
+                        # Angle of the head-top pixel below the image center
+                        angle_down = tilt_used + np.arctan((head_top_y - cy) / focal_px)
+                        # Body height at the footprints' distance: only used to
+                        # look up the spot for this body size
+                        recent_heights.append(height_at(angle_down, patient_dist_cm))
+
+                    if calibrated and spot_points and recent_heights:
+                        if ankle_row >= h - 2:
+                            # Feet are below the bottom of the picture:
+                            # the patient is standing too close
+                            line_offset_cm = -99.0
+                        else:
+                            toe_dist = point_distance_cm(
+                                ankle_row, cy, focal_px, tilt_used, ankle_drop_cm
+                            )
+                            if toe_dist is not None:
+                                body_h = float(np.median(recent_heights))
+                                line_offset_cm = (foot_center_cm(toe_dist, body_h)
+                                                  - expected_spot_cm(body_h))
+
+                    if angle_down is not None:
+                        # Patient's real distance (NEW): footprints distance plus how
+                        # far off the footprints they stand (smoothed, within tolerance)
+                        head_dist_used = patient_dist_cm
+                        if (USE_FEET_FOR_DISTANCE and line_offset_cm is not None
+                                and line_offset_cm > -99):
+                            offset_history.append(line_offset_cm)
+                            off = float(np.clip(np.median(offset_history),
+                                                -LINE_TOLERANCE_CM, LINE_TOLERANCE_CM))
+                            head_dist_used = patient_dist_cm + off
+                        else:
+                            offset_history.clear()
+
+                        # Height of the line of sight at the patient's distance
+                        def row_cm(row):
+                            return height_at(tilt_used + np.arctan((row - cy) / focal_px),
+                                             head_dist_used)
+
+                        outline_cm = height_at(angle_down, head_dist_used)
+                        top_cm = outline_cm - HEAD_TOP_OFFSET_CM   # remove outline blur
+                        hair_cut = False
+                        face_ok = all(p.visibility > BODY_VISIBILITY
+                                      for p in (left_eye, right_eye, mouth_l, mouth_r))
+                        if HAIR_CHECK_ON and face_ok:
+                            eye_row = (left_eye.y + right_eye.y) / 2 * h
+                            mouth_row = (mouth_l.y + mouth_r.y) / 2 * h
+                            if mouth_row > eye_row:
+                                eye_cm = row_cm(eye_row)
+                                skull_history.append(
+                                    eye_cm + SKULL_RATIO * (eye_cm - row_cm(mouth_row)))
+                        if HAIR_CHECK_ON and len(skull_history) >= 5:
+                            skull_cm = float(np.median(skull_history))
+                            if top_cm - skull_cm > HAIR_THRESHOLD_CM:
+                                top_cm = skull_cm                   # outline is hair
+                                hair_cut = True
+                            # show where the program thinks the skull ends (cyan)
+                            if ruler is None:
+                                t_sk = (cam_h_cm - skull_cm) / head_dist_used
+                            else:
+                                t_sk = (skull_cm - ruler[0]) / (
+                                    ruler[1] * head_dist_used / ref_dist_cm)
+                            sky = int(round(cy + focal_px * np.tan(np.arctan(t_sk) - tilt_used)))
+                            cv2.line(frame, (center_x - 25, sky), (center_x + 25, sky),
+                                     (255, 255, 0), 2)
+
+                        height_raw = top_cm
+                        height_now = correct_height(height_raw)
+
+        # ------------------------------------
+        # PATIENT STATE + AUTOMATIC MEASUREMENTS
+        # ------------------------------------
+
+        if full_body:
+            missing_count = 0
+            present_count += 1
+        else:
+            missing_count += 1
+            present_count = 0
+            height_history.clear(); raw_history.clear()
+
+        # Patient left: get ready for the next one
+        if person_seen:
+            last_seen_at = time.monotonic()
+        # Only a NEW patient (nobody in view for NEW_PATIENT_SEC) hears the welcome again,
+        # so a short tracking drop-out doesn't repeat the introduction.
+        if time.monotonic() - last_seen_at >= NEW_PATIENT_SEC and greeted:
+            ankle_row_history.clear()    # next patient's feet start fresh
+            greeted = False
+            posture_corrected = False
+            measure_announced = False
+            remeasures = 0
+            spoken_key = None
+
+        if missing_count >= RESET_FRAMES:
+            recent_heights.clear()       # next person's body size starts fresh
+            skull_history.clear()
+            skull_cm = None
+            offset_history.clear()
+        if missing_count >= RESET_FRAMES and (captures or final_height_cm is not None):
+            captures = []
+            captures_raw = []
+            flash_text = None
+            final_height_cm = None
+            final_saved = False
+            height_history.clear(); raw_history.clear()
+
+        off_line = (
+            line_offset_cm is not None
+            and abs(line_offset_cm) > LINE_TOLERANCE_CM
+        )
+        if off_line:
+            height_history.clear(); raw_history.clear()     # wait until the patient is back on the footprints
+        if posture_bad:
+            height_history.clear(); raw_history.clear()     # wait until the patient stands straight (NEW)
+        if not_facing:
+            height_history.clear(); raw_history.clear()     # wait until they face the camera (NEW)
+
+        measuring = (
+            full_body
+            and calibrated
+            and height_now is not None
+            and final_height_cm is None
+            and present_count > WARMUP_FRAMES
+            and not off_line
+            and not posture_bad          # Sanat's posture check (NEW)
+            and not not_facing           # facing the camera (NEW)
+            and not posture_corrected    # say "Perfect... hold still" first (NEW)
+            and measure_announced        # "Now we will take your measurements" was said
+            and not voice.busy           # wait until the spoken instructions finish
+        )
+
+        pending_shot = None      # screenshot to save after the screen is drawn
+
+        steady = False
+        if measuring:
+            height_history.append(height_now)
+            raw_history.append(height_raw)
+            if len(height_history) == STABLE_FRAMES:
+                steady = np.std(height_history) < STABLE_TOLERANCE_CM
+
+        if measuring and steady:
+
+            measurement = float(np.median(height_history))
+            captures.append(measurement)
+            captures_raw.append(float(np.median(raw_history)))
+            height_history.clear(); raw_history.clear()     # next capture uses fresh frames
+
+            imp, met = format_height(measurement)
+            print(f"Capture {len(captures)}/{CAPTURES_PER_PATIENT}: {imp} / {met}")
+            if outline_cm is not None and skull_cm is not None:
+                print(f"  outline top {outline_cm:.1f} cm, face-estimated skull top "
+                      f"{skull_cm:.1f} cm" + ("  -> hair: using face estimate" if hair_cut
+                                              else "  -> using outline"))
+            pending_shot = f"height_capture_{len(captures)}"
+            if len(captures) < CAPTURES_PER_PATIENT:
+                flash_text = [f"{len(captures)} OF {CAPTURES_PER_PATIENT}",
+                              "PICTURE TAKEN"]
+                flash_until = time.monotonic() + CAPTURE_FLASH_SEC
+                # "One." / "Two." so the patient knows how many are left (NEW)
+                voice.say(VOICE_AFTER_PICTURE.get(len(captures), ""))
+
+            if len(captures) >= CAPTURES_PER_PATIENT:
+                final_height_cm = float(np.median(captures))
+                final_raw_cm = float(np.median(captures_raw))
+                spread = max(captures) - min(captures)
+                imp, met = format_height(final_height_cm)
+                print(f"FINAL HEIGHT: {imp} / {met}  (spread {spread:.1f} cm)")
+                print(f"  RAW: {final_raw_cm:.1f} cm   <- for KNOWN_HEIGHTS: (true_cm, {final_raw_cm:.1f})"
+                      f"   head distance used: {head_dist_used:.1f} cm")
+                if spread > MAX_SPREAD_CM and remeasures < MAX_REMEASURES and "MEASURE_AGAIN" in voice.sounds:
+                    # "We will take your measurements again." - redo the 3 captures
+                    print("  Measurements disagree - measuring again.")
+                    remeasures += 1
+                    captures = []
+                    captures_raw = []
+                    final_height_cm = None
+                    flash_text = None
+                    voice.say("MEASURE_AGAIN")   # "hold still" only if they then move
+                else:
+                    if spread > MAX_SPREAD_CM:
+                        print("  WARNING: measurements disagree - patient may have moved. "
+                              "Consider measuring again.")
+                    pending_shot = None    # the FINAL screenshot covers the last capture
+                    voice.say("SUCCESS_STATION_2")
+                    try:
+                        with open(LOG_FILE, "a", newline="") as f:
+                            csv.writer(f).writerow([
+                                datetime.now().isoformat(timespec="seconds"),
+                                f"{final_height_cm:.1f}", imp, f"{final_raw_cm:.1f}",
+                                " ".join(f"{c:.1f}" for c in captures), f"{spread:.1f}",
+                                "" if not offset_history else f"{np.median(offset_history):+.1f}",
+                                f"{head_dist_used:.1f}",
+                                (f"ruler {ruler_tags} tag(s); " if ruler else "") + correction_text])
+                    except OSError as error:
+                        print(f"  Could not write the log: {error}")
+
+        # ------------------------------------
+        # STAFF INFO PANEL (top left)
+        # ------------------------------------
+
+        panel = []                       # (text, color, big?)
+        if not focal_history:
+            panel.append(("SHOW APRILTAG TO CALIBRATE", (0, 255, 255), True))
+        elif not calibrated:
+            panel.append((f"CALIBRATING {len(focal_history)}/{MIN_CALIBRATION_FRAMES}",
+                          (0, 255, 255), True))
+        elif tag_found:
+            panel.append((f"TAG OK  tilt (live): {np.degrees(tilt_used):.1f} deg", (0, 255, 255), True))
+        else:
+            panel.append((f"TAG HIDDEN  tilt (last): {np.degrees(tilt_used):.1f} deg", (0, 165, 255), True))
+
+        if final_height_cm is not None:
+            imp, met = format_height(final_height_cm)
+            panel.append((f"FINAL: {imp}   {met}", (0, 255, 0), True))
+        elif pending_shot is not None:
+            imp, met = format_height(captures[-1])
+            panel.append((f"Capture {len(captures)}: {imp}   {met}", (0, 255, 0), True))
+        elif height_history:
+            imp, met = format_height(float(np.median(height_history)))
+            panel.append((f"Height: {imp}   {met}", (255, 255, 255), True))
+
+        if captures:
+            panel.append(("Captures (cm): " + "  ".join(f"{c:.1f}" for c in captures),
+                          (255, 255, 255), False))
+
+        if not spot_points:
+            line_text = "Spot: not set - press L"
+        elif line_offset_cm is None:
+            line_text = f"Spot: set ({len(spot_points)} taught)"
+        elif line_offset_cm <= -99:
+            line_text = "Spot: set  feet below picture (too close)"
+        else:
+            line_text = (f"Spot: set ({len(spot_points)})  feet {line_offset_cm:+.1f} cm"
+                         f"  dist {head_dist_used:.0f}")
+        panel.append((line_text, (0, 255, 255), False))
+
+        if REF_TAGS:
+            if ruler is None:
+                panel.append(("RULER: tags not seen yet", (0, 165, 255), False))
+            else:
+                fit_dist = -ruler[1]
+                ok = abs(fit_dist / ref_dist_cm - 1) < 0.10 or ruler_tags < 2
+                size_dist = ruler_tag_distance_cm(focal_px, tilt_used)
+                if size_dist is not None and abs(size_dist - ref_dist_cm) > LINE_TOLERANCE_CM * 2:
+                    ok = False
+                if ok:
+                    panel.append((f"RULER: {ruler_tags} tag(s) OK at {ref_dist_cm:.0f} cm",
+                                  (0, 255, 0), False))
+                else:
+                    where = f"seen at {size_dist:.0f} cm" if size_dist is not None else ""
+                    panel.append((f"RULER: CHECK TAGS {where} (set {ref_dist_cm:.0f})",
+                                  (0, 0, 255), False))
+
+        if show_panel:
+            # size everything from the picture width, so it looks the same at any resolution
+            ui = w / 1600.0
+            big_s, small_s = max(0.4, 0.75 * ui), max(0.35, 0.6 * ui)
+            pad, gap = int(12 * ui) + 4, int(14 * ui) + 6
+            sizes = []
+            for text, _, big in panel:
+                sc = big_s if big else small_s
+                th = max(1, int(round(2 * sc)))
+                (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, sc, th)
+                sizes.append((sc, th, tw, tht))
+            box_w = min(w - 10, max(t[2] for t in sizes) + 2 * pad)
+            box_h = sum(t[3] for t in sizes) + gap * (len(sizes) - 1) + 2 * pad
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (5, 5), (5 + box_w, 5 + box_h), (20, 20, 20), -1)
+            cv2.addWeighted(overlay, PANEL_OPACITY, frame, 1 - PANEL_OPACITY, 0, dst=frame)
+            y = 5 + pad
+            for (text, color, _), (sc, th, tw, tht) in zip(panel, sizes):
+                y += tht
+                cv2.putText(frame, text, (5 + pad, y), cv2.FONT_HERSHEY_SIMPLEX, sc, color, th)
+                y += gap
+
+        # ------------------------------------
+        # PATIENT INSTRUCTIONS (big banner, bottom)
+        # ------------------------------------
+
+        if not calibrated:
+            draw_banner(frame, "PLEASE WAIT\nSystem starting up", (0, 255, 255))
+        elif final_height_cm is not None:
+            imp, _ = format_height(final_height_cm)
+            draw_banner(frame, f"DONE!  {imp}\nYou may step off", (0, 255, 0))
+        elif not person_seen:
+            draw_banner(frame, "STAND ON THE FOOTPRINTS\nFace the camera", (255, 255, 255))
+        elif not full_body:
+            draw_banner(frame, "STEP BACK ONTO THE FOOTPRINTS\nWhole body in view", (0, 165, 255))
+        elif off_line and line_offset_cm < 0:
+            draw_banner(frame, "STEP BACK\nFeet on the footprints", (0, 165, 255))
+        elif off_line:
+            draw_banner(frame, "STEP FORWARD\nFeet on the footprints", (0, 165, 255))
+        elif not_facing:
+            draw_banner(frame, "FACE THE CAMERA\nStand straight, look ahead", (0, 165, 255))
+        elif posture_bad:
+            draw_banner(frame, "STAND TALL\n" + posture_issue, (0, 165, 255))
+        else:
+            n = len(captures) + 1
+            progress = len(height_history) / STABLE_FRAMES
+            draw_banner(
+                frame,
+                f"STAND TALL - LOOK AHEAD\nHOLD STILL - PICTURE {n} OF {CAPTURES_PER_PATIENT}",
+                (255, 255, 255)
+            )
+            # Progress bar for the current measurement
+            bar_y = h - 8
+            cv2.rectangle(frame, (0, bar_y - 6), (int(w * progress), bar_y), (0, 255, 0), -1)
+
+            # Countdown to the next picture (NEW)
+            if SHOW_COUNTDOWN and time.monotonic() >= flash_until:
+                if measuring:
+                    frames_left = STABLE_FRAMES - len(height_history)
+                    if frames_left > 0:
+                        secs = int(np.ceil(frames_left / max(fps_est, 1.0)))
+                        draw_center_text(frame, [str(secs), f"PICTURE {n} OF {CAPTURES_PER_PATIENT}"],
+                                         (0, 255, 255))
+                    else:
+                        # enough frames, but the patient is still moving
+                        draw_center_text(frame, ["HOLD STILL", f"PICTURE {n} OF {CAPTURES_PER_PATIENT}"],
+                                         (0, 165, 255), size=0.45)
+                elif measure_announced or voice.busy:
+                    draw_center_text(frame, ["GET READY", f"PICTURE {n} OF {CAPTURES_PER_PATIENT}"],
+                                     (255, 255, 255), size=0.45)
+
+        # "PICTURE 1 OF 3 TAKEN" flash after each capture (NEW)
+        if (SHOW_COUNTDOWN and flash_text and time.monotonic() < flash_until
+                and final_height_cm is None):
+            draw_center_text(frame, flash_text, (0, 255, 0), size=0.6)
+
+        # ------------------------------------
+        # VOICE PROMPTS (NEW): say the banner out loud
+        # ------------------------------------
+        now = time.monotonic()
+
+        if not calibrated or not person_seen or final_height_cm is not None:
+            key = None
+        elif not full_body:
+            key = "STEP BACK ONTO THE FOOTPRINTS"
+        elif off_line and line_offset_cm < 0:
+            key = "STEP BACK"
+        elif off_line:
+            key = "STEP FORWARD"
+        elif not_facing:
+            key = "FACE THE CAMERA"
+        elif posture_bad:
+            key = "POSTURE:" + posture_issue
+        else:
+            key = "HOLD STILL"
+
+        if key != banner_key:
+            banner_key, banner_since = key, now
+
+        if person_seen and calibrated and not greeted:
+            if not spot_points:
+                # spot not taught: the program can't tell if they're off, so say it once
+                voice.say(*GREETING, "STAND_ON_FOOTPRINTS")
+                spoken_key, spoken_at = "STEP BACK ONTO THE FOOTPRINTS", now
+            else:
+                voice.say(*GREETING)           # footprints only said if they're off them
+                spoken_key = None
+            greeted = True
+        elif key is not None and not voice.busy and now - banner_since >= BANNER_HOLD_SEC:
+            if key == "HOLD STILL":
+                if not measure_announced:
+                    if posture_corrected and "PERFECT" in voice.sounds:
+                        # posture was just fixed: confirm it, then explain the pictures
+                        voice.say("PERFECT", *MEASURING_START)
+                    else:
+                        voice.say(*MEASURING_START)
+                    posture_corrected = False
+                    measure_announced = True
+                    hold_still_at = now
+                elif posture_corrected:
+                    # only after a posture prompt: praise + hold still (one clip)
+                    voice.say("PERFECT" if "PERFECT" in voice.sounds else "HOLD_STILL")
+                    posture_corrected = False
+                    hold_still_at = now
+                elif (len(height_history) == STABLE_FRAMES and not steady
+                      and now - hold_still_at >= HOLD_STILL_REPEAT_SEC):
+                    voice.say("HOLD_STILL")    # moving too much to measure
+                    hold_still_at = now
+            elif key.startswith("POSTURE:"):
+                if key != spoken_key or now - spoken_at >= REPEAT_SEC:
+                    clips = VOICE_FOR_POSTURE.get(key[len("POSTURE:"):], [])
+                    if not all(c in voice.sounds for c in clips) or not clips:
+                        clips = ["STAND_STRAIGHT"]       # fallback until the new clips exist
+                    voice.say(*clips)
+                    spoken_key, spoken_at = key, now
+                    posture_corrected = True
+            elif key != spoken_key or now - spoken_at >= REPEAT_SEC:
+                voice.say(*VOICE_FOR_BANNER[key])
+                spoken_key, spoken_at = key, now
+        # (Corrections no longer cut into the welcome. They wait until it finishes,
+        #  and by then most people have already stepped onto the footprints.)
+
+        voice.update()
+
+        # Save screenshots now that the panel and banner are drawn
+        if pending_shot is not None:
+            shot = save_screenshot(frame, pending_shot)
+            print(f"  saved: {shot}")
+
+        # Save one final screenshot with the result banner on it
+        if final_height_cm is not None and not final_saved:
+            shot = save_screenshot(frame, "height_FINAL")
+            print(f"Final screenshot saved: {shot}")
+            final_saved = True
+
+        # ------------------------------------
+        # CAMERA WINDOW
+        # ------------------------------------
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in (ord("q"), ord("Q")):
+            break
+
+        elif key in (ord("f"), ord("F")):
+            fullscreen = not fullscreen
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+
+        elif key in (ord("h"), ord("H")):
+            show_panel = not show_panel
+
+        elif key in (ord("c"), ord("C")):
+            focal_history.clear()
+            tilt_history.clear()
+            ever_calibrated = False
+            print("Recalibrating: keep the booth empty so the AprilTag is visible.")
+
+        elif key in (ord("l"), ord("L")):
+            if not calibrated:
+                print("Can't set the spot yet: wait until the AprilTag calibration finishes.")
+            elif len(ankle_row_history) < 5:
+                print("Can't set the spot: stand on the footprints with your ankles clearly visible.")
+            else:
+                taught = point_distance_cm(
+                    float(np.median(ankle_row_history)), cy, focal_px, tilt_used,
+                    cam_h_cm
+                )
+                if taught is None:
+                    print("Can't set the spot: feet not clearly in view.")
+                elif len(recent_heights) < 5:
+                    print("Can't set the spot: stand so your whole body (head too) is in view.")
+                else:
+                    body_h = float(np.median(recent_heights))
+                    center = foot_center_cm(taught, body_h)
+                    # Same-size person again? Replace their spot instead of adding one
+                    spot_points[:] = [p for p in spot_points
+                                      if abs(p[0] - body_h) >= SPOT_MIN_HEIGHT_GAP_CM]
+                    spot_points.append((body_h, center))
+                    offset_history.clear()
+
+        elif key in (ord("k"), ord("K")):
+            spot_points.clear()
+            offset_history.clear()
+            print("Standing spots forgotten - press L to teach again.")
+
+        elif key in (ord("p"), ord("P")):
+            if posture.set_baseline():
+                print("Posture reference set from the current posture.")
+            else:
+                print("Can't set posture reference yet - stand in view for a moment first.")
+
+        elif key in (ord("s"), ord("S")):
+            shot = save_screenshot(frame, "manual_capture")
+            print(f"Manual screenshot saved: {shot}")
+
+finally:
+    voice.stop()
+    cap.release()
+    pose.close()
+    cv2.destroyAllWindows()
